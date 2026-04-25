@@ -12,80 +12,102 @@ const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
 
-app.use(cors());
+app.use(cors({
+  origin: process.env.ALLOWED_ORIGIN,
+  methods: ["POST"],
+  allowedHeaders: ["Content-Type"]
+}));
+
 app.use(express.json({ limit: "10mb" }));
 
-app.get("/", (req, res) => {
-  res.json({ status: "CLAVIS AI backend aktif" });
+// ÜRÜN HAVUZU
+const PRODUCTS = [
+  {
+    name: "La Roche-Posay Effaclar Temizleme Jeli",
+    tags: ["akne", "yağlı"],
+    url: "https://www.expo-pharma.com/products/la-roche-posay-effaclar-temizleme-jeli"
+  },
+  {
+    name: "Bioderma Pigmentbio Serum",
+    tags: ["leke"],
+    url: "https://www.expo-pharma.com/products/bioderma-pigmentbio-serum"
+  },
+  {
+    name: "Vichy SPF 50",
+    tags: ["spf"],
+    url: "https://www.expo-pharma.com/products/vichy-spf50"
+  }
+];
+
+// TRIAGE + ANALİZ
+app.post("/api/clavis-analyze", async (req, res) => {
+  try {
+    const { message, answers, stage } = req.body;
+
+    // 1️⃣ SORU SORMA
+    if (stage === "triage") {
+      const prompt = `
+Sen bir eczacısın.
+
+Kullanıcıdan doğru ürünü önermek için maksimum 4 kısa soru sor.
+
+JSON dön:
+{
+ "questions": ["soru1", "soru2"],
+ "needImage": true
+}
+
+Kullanıcı:
+${message}
+`;
+
+      const r = await client.responses.create({
+        model: "gpt-5.4",
+        input: prompt
+      });
+
+      return res.json(JSON.parse(r.output_text));
+    }
+
+    // 2️⃣ ANALİZ + ÜRÜN
+    if (stage === "analysis") {
+
+      const text = JSON.stringify(answers).toLowerCase();
+
+      const matched = PRODUCTS.filter(p =>
+        p.tags.some(tag => text.includes(tag))
+      );
+
+      const prompt = `
+Sen eczacısın.
+
+KISA analiz yap ve ürün öner.
+
+Kullanıcı:
+${JSON.stringify(answers)}
+`;
+
+      const r = await client.responses.create({
+        model: "gpt-5.4",
+        input: prompt
+      });
+
+      return res.json({
+        analysis: r.output_text,
+        products: matched
+      });
+    }
+
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "CLAVIS AI hata verdi" });
+  }
 });
 
 app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
-app.post("/api/clavis-analyze", async (req, res) => {
-  try {
-    console.log("BODY:", req.body);
-
-    const userInput =
-      req.body?.input ||
-      req.body?.message ||
-      req.body?.prompt ||
-      req.body?.userNote ||
-      "";
-
-    if (!userInput || !userInput.trim()) {
-      return res.status(400).json({
-        error: "Kullanıcı girdisi yok."
-      });
-    }
-
-    const prompt = `
-Sen Expo Pharma'nın CLAVIS AI ürün danışmanısın.
-
-Türkçe cevap ver.
-Tıbbi teşhis koyma.
-Reçete, ilaç tedavisi veya kesin tedavi önerme.
-Kozmetik, dermokozmetik, vitamin ve genel ürün danışmanlığı dilinde konuş.
-"yardımcı olabilir", "destekleyebilir", "uygun olabilir" gibi güvenli ifadeler kullan.
-
-Kullanıcının sorusu:
-${userInput}
-
-Cevabı şu formatta ver:
-
-1. Kısa Değerlendirme
-2. Sabah Rutini
-3. Akşam Rutini
-4. Dikkat Edilmesi Gerekenler
-5. Eczacıya Danış Notu
-
-Cevap sade, anlaşılır ve satış sitesine uygun olsun.
-`;
-
-    const response = await client.responses.create({
-      model: "gpt-4o-mini",
-      input: prompt
-    });
-
-    const result =
-      response.output_text ||
-      "Şu anda sonuç oluşturulamadı. Lütfen tekrar deneyin.";
-
-    return res.json({
-      result: result,
-      disclaimer:
-        "Bu öneri genel ürün danışmanlığıdır. Tanı ve tedavi yerine geçmez."
-    });
-  } catch (error) {
-    console.error("CLAVIS ERROR:", error);
-
-    return res.status(500).json({
-      error: "CLAVIS AI şu anda yanıt veremiyor."
-    });
-  }
-});
-
 app.listen(port, () => {
-  console.log(`CLAVIS AI backend running on port ${port}`);
+  console.log("Server çalışıyor:", port);
 });
