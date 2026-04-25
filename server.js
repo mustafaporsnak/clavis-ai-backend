@@ -12,139 +12,77 @@ const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
 });
 
-app.use(
-  cors({
-    origin: process.env.ALLOWED_ORIGIN,
-    methods: ["POST"],
-    allowedHeaders: ["Content-Type"]
-  })
-);
-
+app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
-const PRODUCT_CATALOG = [
+// Basit ürün havuzu
+const PRODUCTS = [
   {
-    id: "lrp-effaclar-gel",
     name: "La Roche-Posay Effaclar Temizleme Jeli",
-    brand: "La Roche-Posay",
-    tags: ["akne", "yağlı", "karma", "temizleyici", "hassas"],
     url: "https://www.expo-pharma.com/products/la-roche-posay-effaclar-temizleme-jeli"
   },
   {
-    id: "bioderma-pigmentbio",
     name: "Bioderma Pigmentbio Serum",
-    brand: "Bioderma",
-    tags: ["leke", "hassas", "serum"],
     url: "https://www.expo-pharma.com/products/bioderma-pigmentbio-serum"
   },
   {
-    id: "vichy-spf50",
     name: "Vichy SPF 50 Güneş Koruyucu",
-    brand: "Vichy",
-    tags: ["spf", "güneş", "leke", "hassas"],
     url: "https://www.expo-pharma.com/products/vichy-spf50"
   },
   {
-    id: "cerave-moisturizer",
     name: "CeraVe Nemlendirici Losyon",
-    brand: "CeraVe",
-    tags: ["kuruluk", "hassas", "nemlendirici", "bariyer"],
     url: "https://www.expo-pharma.com/products/cerave-nemlendirici-losyon"
   }
 ];
 
-function normalize(value) {
-  return String(value || "").toLocaleLowerCase("tr-TR").trim();
-}
-
-function matchProducts(profile) {
-  const skinType = normalize(profile.skinType);
-  const concern = normalize(profile.concern);
-  const sensitivity = normalize(profile.sensitivity);
-
-  const scored = PRODUCT_CATALOG.map((product) => {
-    let score = 0;
-    const tags = product.tags.map(normalize);
-
-    if (tags.includes(concern)) score += 5;
-    if (tags.includes(skinType)) score += 3;
-    if (sensitivity === "evet" && tags.includes("hassas")) score += 2;
-
-    return { ...product, score };
-  });
-
-  return scored
-    .filter((p) => p.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 3);
-}
-
 app.post("/api/clavis-analyze", async (req, res) => {
   try {
-    const {
-      skinType,
-      concern,
-      sensitivity,
-      spfUsage,
-      ageRange,
-      routineStyle,
-      userNote
-    } = req.body || {};
+    const userInput =
+      req.body?.input ||
+      req.body?.message ||
+      req.body?.prompt ||
+      "";
 
-    if (!skinType || !concern || !sensitivity || !spfUsage || !ageRange || !routineStyle) {
-      return res.status(400).json({ error: "Eksik alan var." });
+    if (!userInput) {
+      return res.status(400).json({ error: "Kullanıcı girdisi yok." });
     }
 
-    const matchedProducts = matchProducts({
-      skinType,
-      concern,
-      sensitivity
-    });
-
-    const productSummary = matchedProducts
-      .map((p) => `- ${p.name} (${p.brand}) -> ${p.url}`)
-      .join("\n");
+    const productList = PRODUCTS.map(
+      (p) => `- ${p.name}: ${p.url}`
+    ).join("\n");
 
     const prompt = `
 Türkçe yaz.
 Tıbbi teşhis koyma.
-Nazik ve güvenli bakım önerisi ver.
-"yardımcı olabilir", "destekleyebilir", "uygun olabilir" dilini kullan.
+Nazik ve güvenli öneriler ver.
+"yardımcı olabilir", "destekleyebilir" gibi ifadeler kullan.
 
-Çıktı şu başlıklarda olsun:
-1. Kısa Cilt Profili
-2. Sabah Rutini
-3. Akşam Rutini
-4. Nazik Uyarı
+Kullanıcı şunu yazdı:
+"${userInput}"
 
-Kullanıcı bilgileri:
-- Cilt tipi: ${skinType}
-- Temel ihtiyaç: ${concern}
-- Hassasiyet: ${sensitivity}
-- SPF kullanımı: ${spfUsage}
-- Yaş aralığı: ${ageRange}
-- Rutin tercihi: ${routineStyle}
-- Ek not: ${userNote || "Yok"}
+Şu başlıklarda cevap ver:
+1. Kısa değerlendirme
+2. Sabah rutini
+3. Akşam rutini
+4. Önerilebilecek ürünler
 
-Önerilecek ürün havuzu:
-${productSummary}
+Ürün listesi:
+${productList}
 `;
 
     const response = await client.responses.create({
-      model: "gpt-5.4",
+      model: "gpt-4.1-mini",
       input: prompt
     });
 
-    const analysisText =
+    const text =
       response.output_text ||
-      "Sonuç oluşturulurken bir sorun oluştu. Lütfen tekrar deneyin.";
+      "Şu anda cevap oluşturulamadı.";
 
     return res.json({
-      analysis: analysisText,
-      products: matchedProducts,
-      disclaimer:
-        "Bu öneri genel bakım yönlendirmesidir. Tıbbi teşhis veya tedavi yerine geçmez."
+      result: text
     });
+
   } catch (error) {
     console.error(error);
     return res.status(500).json({
@@ -153,10 +91,11 @@ ${productSummary}
   }
 });
 
-app.get("/health", (_req, res) => {
-  res.json({ ok: true });
+// Test endpoint
+app.get("/health", (req, res) => {
+  res.json({ status: "ok" });
 });
 
 app.listen(port, () => {
-  console.log(`CLAVIS AI backend running on port ${port}`);
+  console.log("Server çalışıyor:", port);
 });
