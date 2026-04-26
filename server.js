@@ -18,7 +18,7 @@ app.use(express.json({ limit: "20mb" }));
 const SHOP_DOMAIN = "https://www.expo-pharma.com";
 
 /* -------------------------------
-   Yardımcı fonksiyonlar
+   YARDIMCI FONKSİYONLAR
 -------------------------------- */
 
 function normalizeText(value) {
@@ -59,24 +59,41 @@ function safeJsonParse(text) {
 }
 
 /* -------------------------------
-   Shopify ürünlerini oku
+   SHOPIFY ÜRÜNLERİNİ SAYFALI OKU
+   250 sınırını aşmak için page kullanıyoruz
 -------------------------------- */
 
 async function fetchShopifyProducts() {
-  const url = `${SHOP_DOMAIN}/products.json?limit=250`;
+  const allProducts = [];
+  const limit = 250;
+  let page = 1;
 
-  const response = await fetch(url);
+  while (true) {
+    const url = `${SHOP_DOMAIN}/products.json?limit=${limit}&page=${page}`;
+    const response = await fetch(url);
 
-  if (!response.ok) {
-    throw new Error("Shopify ürünleri okunamadı.");
+    if (!response.ok) {
+      throw new Error("Shopify ürünleri okunamadı.");
+    }
+
+    const data = await response.json();
+    const products = Array.isArray(data.products) ? data.products : [];
+
+    if (products.length === 0) break;
+
+    allProducts.push(...products);
+
+    if (products.length < limit) break;
+
+    page++;
+
+    if (page > 20) break;
   }
 
-  const data = await response.json();
-  const products = Array.isArray(data.products) ? data.products : [];
-
-  return products.map((p) => {
+  return allProducts.map((p) => {
     const variants = Array.isArray(p.variants) ? p.variants : [];
     const firstVariant = variants[0] || {};
+
     const price = toNumber(firstVariant.price);
     const compareAtPrice = toNumber(firstVariant.compare_at_price);
 
@@ -108,12 +125,47 @@ async function fetchShopifyProducts() {
 }
 
 /* -------------------------------
-   Ürün eşleştirme
+   CLAVIS ÜRÜN EŞLEŞTİRME
 -------------------------------- */
 
 async function matchProductsFromShopify(answerText) {
   const products = await fetchShopifyProducts();
   const normalizedAnswer = normalizeText(answerText);
+
+  const keywords = [
+    "sivilce",
+    "akne",
+    "yağlı",
+    "yagli",
+    "karma",
+    "gözenek",
+    "gozenek",
+    "leke",
+    "güneş",
+    "gunes",
+    "spf",
+    "hassas",
+    "kızarıklık",
+    "kizariklik",
+    "kuruluk",
+    "nem",
+    "bariyer",
+    "vitamin",
+    "takviye",
+    "omega",
+    "kolajen",
+    "saç",
+    "sac",
+    "bebek",
+    "pişik",
+    "pisik",
+    "medikal",
+    "tansiyon",
+    "şeker",
+    "seker",
+    "ateş",
+    "ates"
+  ];
 
   const scored = products.map((product) => {
     const searchText = normalizeText(`
@@ -126,34 +178,11 @@ async function matchProductsFromShopify(answerText) {
 
     let score = 0;
 
-    const keywords = [
-      "sivilce",
-      "akne",
-      "yağlı",
-      "yagli",
-      "leke",
-      "güneş",
-      "gunes",
-      "spf",
-      "hassas",
-      "kuruluk",
-      "nem",
-      "bariyer",
-      "vitamin",
-      "takviye",
-      "bebek",
-      "pişik",
-      "pisik",
-      "medikal",
-      "tansiyon",
-      "şeker",
-      "seker"
-    ];
-
     keywords.forEach((keyword) => {
       const k = normalizeText(keyword);
+
       if (normalizedAnswer.includes(k) && searchText.includes(k)) {
-        score += 3;
+        score += 4;
       }
     });
 
@@ -173,7 +202,7 @@ async function matchProductsFromShopify(answerText) {
 }
 
 /* -------------------------------
-   Fiyat / ürün denetimi
+   FİYAT / ÜRÜN DENETİMİ
 -------------------------------- */
 
 function auditProducts(products, options = {}) {
@@ -249,7 +278,7 @@ function auditProducts(products, options = {}) {
 }
 
 /* -------------------------------
-   Temel endpointler
+   TEMEL ENDPOINTLER
 -------------------------------- */
 
 app.get("/", (req, res) => {
@@ -266,7 +295,7 @@ app.get("/health", (req, res) => {
 });
 
 /* -------------------------------
-   Shopify ürün listeleme endpointi
+   ÜRÜNLERİ LİSTELE
 -------------------------------- */
 
 app.get("/api/shopify-products", async (req, res) => {
@@ -286,7 +315,7 @@ app.get("/api/shopify-products", async (req, res) => {
 });
 
 /* -------------------------------
-   Fiyat denetimi endpointi
+   FİYAT DENETİMİ
 -------------------------------- */
 
 app.get("/api/price-audit", async (req, res) => {
@@ -305,7 +334,7 @@ app.get("/api/price-audit", async (req, res) => {
 });
 
 /* -------------------------------
-   CLAVIS AI danışmanlık endpointi
+   CLAVIS AI DANIŞMANLIK
 -------------------------------- */
 
 app.post("/api/clavis-analyze", async (req, res) => {
