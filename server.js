@@ -16,6 +16,29 @@ app.use(cors());
 app.use(express.json({ limit: "20mb" }));
 
 const SHOP_DOMAIN = "https://www.expo-pharma.com";
+const CLAVIS_ADMIN_PASSWORD = process.env.CLAVIS_ADMIN_PASSWORD;
+
+/* -------------------------------
+   ADMIN ŞİFRE KONTROLÜ
+-------------------------------- */
+
+function checkAdminPassword(req, res, next) {
+  const password = req.headers["x-clavis-admin-password"];
+
+  if (!CLAVIS_ADMIN_PASSWORD) {
+    return res.status(500).json({
+      error: "Admin şifresi Render Environment içinde tanımlı değil."
+    });
+  }
+
+  if (!password || password !== CLAVIS_ADMIN_PASSWORD) {
+    return res.status(401).json({
+      error: "Yetkisiz erişim. Şifre hatalı veya eksik."
+    });
+  }
+
+  next();
+}
 
 /* -------------------------------
    YARDIMCI FONKSİYONLAR
@@ -60,7 +83,6 @@ function safeJsonParse(text) {
 
 /* -------------------------------
    SHOPIFY ÜRÜNLERİNİ SAYFALI OKU
-   250 sınırını aşmak için page kullanıyoruz
 -------------------------------- */
 
 async function fetchShopifyProducts() {
@@ -295,10 +317,11 @@ app.get("/health", (req, res) => {
 });
 
 /* -------------------------------
-   ÜRÜNLERİ LİSTELE
+   ADMIN: ÜRÜNLERİ LİSTELE
+   ŞİFRELİ
 -------------------------------- */
 
-app.get("/api/shopify-products", async (req, res) => {
+app.get("/api/shopify-products", checkAdminPassword, async (req, res) => {
   try {
     const products = await fetchShopifyProducts();
 
@@ -315,10 +338,11 @@ app.get("/api/shopify-products", async (req, res) => {
 });
 
 /* -------------------------------
-   FİYAT DENETİMİ
+   ADMIN: FİYAT DENETİMİ
+   ŞİFRELİ
 -------------------------------- */
 
-app.get("/api/price-audit", async (req, res) => {
+app.get("/api/price-audit", checkAdminPassword, async (req, res) => {
   try {
     const minSuspiciousPrice = req.query.minPrice || 10;
     const products = await fetchShopifyProducts();
@@ -335,6 +359,8 @@ app.get("/api/price-audit", async (req, res) => {
 
 /* -------------------------------
    CLAVIS AI DANIŞMANLIK
+   MÜŞTERİ TARAFI
+   ŞİFRE YOK
 -------------------------------- */
 
 app.post("/api/clavis-analyze", async (req, res) => {
