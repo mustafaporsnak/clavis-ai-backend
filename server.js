@@ -42,8 +42,6 @@ function checkAdminPassword(req, res, next) {
   next();
 }
 
-  next();
-}
 
 /* -------------------------------
    YARDIMCI FONKSİYONLAR
