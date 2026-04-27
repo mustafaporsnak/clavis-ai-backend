@@ -17,6 +17,7 @@ app.use(express.json({ limit: "20mb" }));
 
 const SHOP_DOMAIN = "https://www.expo-pharma.com";
 const CLAVIS_ADMIN_PASSWORD = process.env.CLAVIS_ADMIN_PASSWORD;
+const CLAVIS_SHEET_URL = process.env.CLAVIS_SHEET_URL;
 
 /* -------------------------------
    ADMIN ŞİFRE KONTROLÜ
@@ -57,7 +58,16 @@ function normalizeText(value) {
 }
 
 function toNumber(value) {
-  const n = Number(String(value || "").replace(",", "."));
+  if (typeof value === "number") return value;
+
+  const cleaned = String(value || "")
+    .replace("TL", "")
+    .replace("₺", "")
+    .replaceAll(".", "")
+    .replace(",", ".")
+    .trim();
+
+  const n = Number(cleaned);
   return Number.isFinite(n) ? n : 0;
 }
 
@@ -79,6 +89,99 @@ function safeJsonParse(text) {
   } catch {
     return null;
   }
+}
+
+function getField(item, possibleNames) {
+  for (const name of possibleNames) {
+    if (item[name] !== undefined && item[name] !== null && item[name] !== "") {
+      return item[name];
+    }
+  }
+  return "";
+}
+
+/* -------------------------------
+   GOOGLE SHEET MALİYET TABLOSU
+-------------------------------- */
+
+async function fetchCostSheet() {
+  if (!CLAVIS_SHEET_URL) {
+    return [];
+  }
+
+  const response = await fetch(CLAVIS_SHEET_URL);
+
+  if (!response.ok) {
+    throw new Error("Google Sheet maliyet tablosu okunamadı.");
+  }
+
+  const data = await response.json();
+  const items = Array.isArray(data.items) ? data.items : [];
+
+  return items.map((item) => {
+    return {
+      handle: String(getField(item, ["handle", "Handle"]) || "").trim(),
+      sku: String(getField(item, ["sku", "SKU"]) || "").trim(),
+      barcode: String(getField(item, ["barkod", "barcode", "Barkod"]) || "").trim(),
+      productName: String(getField(item, ["ürün adı", "urun adı", "ürün adi", "product name"]) || "").trim(),
+      supplyType: String(getField(item, ["tedarik tipi", "supply type"]) || "").trim(),
+      costPrice: toNumber(getField(item, ["geliş fiyatı", "gelis fiyati", "geliş fiyat", "maliyet"])),
+      psf: toNumber(getField(item, ["PSF", "psf"])),
+      minimumSalePrice: toNumber(getField(item, ["minimum satış fiyatı", "minimum satis fiyati"])),
+      shippingCost: toNumber(getField(item, ["kargo maliyeti", "kargo"])),
+      paymentCommissionRate: toNumber(getField(item, ["ödeme komisyonu %", "odeme komisyonu %", "komisyon %"])),
+      pharmacistCommission: toNumber(getField(item, ["eczacı komisyonu", "eczaci komisyonu"])),
+      pharmacistCommissionType: String(getField(item, ["eczacı komisyon tipi", "eczaci komisyon tipi"]) || "TL").trim(),
+      targetProfitRate: toNumber(getField(item, ["hedef kâr %", "hedef kar %"])),
+      note: String(getField(item, ["not", "Not"]) || "").trim()
+    };
+  });
+}
+
+function matchCostData(product, costItems) {
+  const productHandle = normalizeText(product.handle);
+  const productSkuList = product.variants.map((v) => normalizeText(v.sku)).filter(Boolean);
+
+  return costItems.find((item) => {
+    const itemHandle = normalizeText(item.handle);
+    const itemSku = normalizeText(item.sku);
+
+    if (itemHandle && itemHandle === productHandle) return true;
+    if (itemSku && productSkuList.includes(itemSku)) return true;
+
+    return false;
+  });
+}
+
+function calculateProfit(product, cost) {
+  const salePrice = Number(product.price || 0);
+  const costPrice = Number(cost?.costPrice || 0);
+  const shippingCost = Number(cost?.shippingCost || 0);
+  const paymentRate = Number(cost?.paymentCommissionRate || 0);
+
+  let pharmacistCommission = Number(cost?.pharmacistCommission || 0);
+
+  if (String(cost?.pharmacistCommissionType || "").includes("%")) {
+    pharmacistCommission = salePrice * (pharmacistCommission / 100);
+  }
+
+  const paymentCommission = salePrice * (paymentRate / 100);
+
+  const netProfit =
+    salePrice -
+    costPrice -
+    shippingCost -
+    paymentCommission -
+    pharmacistCommission;
+
+  return {
+    salePrice,
+    costPrice,
+    shippingCost,
+    paymentCommission,
+    pharmacistCommission,
+    netProfit
+  };
 }
 
 /* -------------------------------
@@ -138,12 +241,150 @@ async function fetchShopifyProducts() {
         id: v.id,
         title: v.title || "",
         sku: v.sku || "",
+        barcode: v.barcode || "",
         price: toNumber(v.price),
         compareAtPrice: toNumber(v.compare_at_price),
         available: Boolean(v.available)
       }))
     };
   });
+}
+
+/* -------------------------------
+   FİYAT / MALİYET DENETİMİ
+-------------------------------- */
+
+function auditProducts(products, costItems, options = {}) {
+  const minSuspiciousPrice = Number(options.minSuspiciousPrice || 10);
+
+  const zeroPrice = [];
+  const missingImage = [];
+  const missingHandle = [];
+  const suspiciousLowPrice = [];
+  const compareAtProblem = [];
+  const variantPriceMismatch = [];
+
+  const missingCost = [];
+  const missingPsf = [];
+  const belowCost = [];
+  const lowProfit = [];
+  const belowMinimumSalePrice = [];
+  const psfAbove = [];
+  const psfBelow = [];
+
+  products.forEach((product) => {
+    const cost = matchCostData(product, costItems);
+    const profit = cost ? calculateProfit(product, cost) : null;
+
+    const enrichedProduct = {
+      ...product,
+      cost,
+      profit
+    };
+
+    if (!product.handle) {
+      missingHandle.push(enrichedProduct);
+    }
+
+    if (!product.image) {
+      missingImage.push(enrichedProduct);
+    }
+
+    if (!product.price || product.price <= 0) {
+      zeroPrice.push(enrichedProduct);
+    }
+
+    if (product.price > 0 && product.price < minSuspiciousPrice) {
+      suspiciousLowPrice.push(enrichedProduct);
+    }
+
+    if (
+      product.compareAtPrice > 0 &&
+      product.price > 0 &&
+      product.compareAtPrice < product.price
+    ) {
+      compareAtProblem.push(enrichedProduct);
+    }
+
+    const validVariantPrices = product.variants
+      .map((v) => v.price)
+      .filter((p) => p > 0);
+
+    if (validVariantPrices.length >= 2) {
+      const min = Math.min(...validVariantPrices);
+      const max = Math.max(...validVariantPrices);
+
+      if (min > 0 && max / min >= 3) {
+        variantPriceMismatch.push({
+          ...enrichedProduct,
+          minVariantPrice: min,
+          maxVariantPrice: max
+        });
+      }
+    }
+
+    if (!cost) {
+      missingCost.push(enrichedProduct);
+      return;
+    }
+
+    if (!cost.psf || cost.psf <= 0) {
+      missingPsf.push(enrichedProduct);
+    }
+
+    if (cost.psf > 0 && product.price > cost.psf) {
+      psfAbove.push(enrichedProduct);
+    }
+
+    if (cost.psf > 0 && product.price > 0 && product.price < cost.psf) {
+      psfBelow.push(enrichedProduct);
+    }
+
+    if (cost.minimumSalePrice > 0 && product.price > 0 && product.price < cost.minimumSalePrice) {
+      belowMinimumSalePrice.push(enrichedProduct);
+    }
+
+    if (profit && product.price > 0 && profit.netProfit < 0) {
+      belowCost.push(enrichedProduct);
+    }
+
+    if (profit && product.price > 0 && profit.netProfit >= 0 && profit.netProfit < 30) {
+      lowProfit.push(enrichedProduct);
+    }
+  });
+
+  return {
+    summary: {
+      totalProducts: products.length,
+      costRows: costItems.length,
+      zeroPriceCount: zeroPrice.length,
+      missingImageCount: missingImage.length,
+      missingHandleCount: missingHandle.length,
+      suspiciousLowPriceCount: suspiciousLowPrice.length,
+      compareAtProblemCount: compareAtProblem.length,
+      variantPriceMismatchCount: variantPriceMismatch.length,
+      missingCostCount: missingCost.length,
+      missingPsfCount: missingPsf.length,
+      belowCostCount: belowCost.length,
+      lowProfitCount: lowProfit.length,
+      belowMinimumSalePriceCount: belowMinimumSalePrice.length,
+      psfAboveCount: psfAbove.length,
+      psfBelowCount: psfBelow.length
+    },
+    zeroPrice,
+    missingImage,
+    missingHandle,
+    suspiciousLowPrice,
+    compareAtProblem,
+    variantPriceMismatch,
+    missingCost,
+    missingPsf,
+    belowCost,
+    lowProfit,
+    belowMinimumSalePrice,
+    psfAbove,
+    psfBelow
+  };
 }
 
 /* -------------------------------
@@ -224,82 +465,6 @@ async function matchProductsFromShopify(answerText) {
 }
 
 /* -------------------------------
-   FİYAT / ÜRÜN DENETİMİ
--------------------------------- */
-
-function auditProducts(products, options = {}) {
-  const minSuspiciousPrice = Number(options.minSuspiciousPrice || 10);
-
-  const zeroPrice = [];
-  const missingImage = [];
-  const missingHandle = [];
-  const suspiciousLowPrice = [];
-  const compareAtProblem = [];
-  const variantPriceMismatch = [];
-
-  products.forEach((product) => {
-    if (!product.handle) {
-      missingHandle.push(product);
-    }
-
-    if (!product.image) {
-      missingImage.push(product);
-    }
-
-    if (!product.price || product.price <= 0) {
-      zeroPrice.push(product);
-    }
-
-    if (product.price > 0 && product.price < minSuspiciousPrice) {
-      suspiciousLowPrice.push(product);
-    }
-
-    if (
-      product.compareAtPrice > 0 &&
-      product.price > 0 &&
-      product.compareAtPrice < product.price
-    ) {
-      compareAtProblem.push(product);
-    }
-
-    const validVariantPrices = product.variants
-      .map((v) => v.price)
-      .filter((p) => p > 0);
-
-    if (validVariantPrices.length >= 2) {
-      const min = Math.min(...validVariantPrices);
-      const max = Math.max(...validVariantPrices);
-
-      if (min > 0 && max / min >= 3) {
-        variantPriceMismatch.push({
-          ...product,
-          minVariantPrice: min,
-          maxVariantPrice: max
-        });
-      }
-    }
-  });
-
-  return {
-    summary: {
-      totalProducts: products.length,
-      zeroPriceCount: zeroPrice.length,
-      missingImageCount: missingImage.length,
-      missingHandleCount: missingHandle.length,
-      suspiciousLowPriceCount: suspiciousLowPrice.length,
-      compareAtProblemCount: compareAtProblem.length,
-      variantPriceMismatchCount: variantPriceMismatch.length
-    },
-    zeroPrice,
-    missingImage,
-    missingHandle,
-    suspiciousLowPrice,
-    compareAtProblem,
-    variantPriceMismatch
-  };
-}
-
-/* -------------------------------
    TEMEL ENDPOINTLER
 -------------------------------- */
 
@@ -308,7 +473,8 @@ app.get("/", (req, res) => {
     status: "CLAVIS AI backend aktif",
     health: "/health",
     products: "/api/shopify-products",
-    priceAudit: "/api/price-audit"
+    priceAudit: "/api/price-audit",
+    costSheet: "/api/cost-sheet"
   });
 });
 
@@ -317,9 +483,24 @@ app.get("/health", (req, res) => {
 });
 
 /* -------------------------------
-   ADMIN: ÜRÜNLERİ LİSTELE
-   ŞİFRELİ
+   ADMIN ENDPOINTLERİ
 -------------------------------- */
+
+app.get("/api/cost-sheet", checkAdminPassword, async (req, res) => {
+  try {
+    const costItems = await fetchCostSheet();
+
+    return res.json({
+      count: costItems.length,
+      items: costItems
+    });
+  } catch (error) {
+    console.error("COST SHEET ERROR:", error);
+    return res.status(500).json({
+      error: "Maliyet tablosu okunamadı."
+    });
+  }
+});
 
 app.get("/api/shopify-products", checkAdminPassword, async (req, res) => {
   try {
@@ -337,16 +518,12 @@ app.get("/api/shopify-products", checkAdminPassword, async (req, res) => {
   }
 });
 
-/* -------------------------------
-   ADMIN: FİYAT DENETİMİ
-   ŞİFRELİ
--------------------------------- */
-
 app.get("/api/price-audit", checkAdminPassword, async (req, res) => {
   try {
     const minSuspiciousPrice = req.query.minPrice || 10;
     const products = await fetchShopifyProducts();
-    const report = auditProducts(products, { minSuspiciousPrice });
+    const costItems = await fetchCostSheet();
+    const report = auditProducts(products, costItems, { minSuspiciousPrice });
 
     return res.json(report);
   } catch (error) {
@@ -359,8 +536,6 @@ app.get("/api/price-audit", checkAdminPassword, async (req, res) => {
 
 /* -------------------------------
    CLAVIS AI DANIŞMANLIK
-   MÜŞTERİ TARAFI
-   ŞİFRE YOK
 -------------------------------- */
 
 app.post("/api/clavis-analyze", async (req, res) => {
