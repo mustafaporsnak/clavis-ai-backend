@@ -24,19 +24,23 @@ const CLAVIS_SHEET_URL = process.env.CLAVIS_SHEET_URL;
 -------------------------------- */
 
 function checkAdminPassword(req, res, next) {
-  const password = req.headers["x-clavis-admin-password"];
+  const password = String(req.headers["x-clavis-admin-password"] || "").trim();
+  const realPassword = String(CLAVIS_ADMIN_PASSWORD || "").trim();
 
-  if (!CLAVIS_ADMIN_PASSWORD) {
+  if (!realPassword) {
     return res.status(500).json({
       error: "Admin şifresi Render Environment içinde tanımlı değil."
     });
   }
 
-  if (!password || password !== CLAVIS_ADMIN_PASSWORD) {
+  if (!password || password !== realPassword) {
     return res.status(401).json({
       error: "Yetkisiz erişim. Şifre hatalı veya eksik."
     });
   }
+
+  next();
+}
 
   next();
 }
