@@ -16,77 +16,67 @@ const client = new OpenAI({
 app.use(cors());
 app.use(express.json({ limit: "20mb" }));
 
+/* -------------------------------
+   SABİTLER
+-------------------------------- */
+
 const SHOP_DOMAIN = "https://www.expo-pharma.com";
 
 const CLAVIS_ADMIN_PASSWORD = process.env.CLAVIS_ADMIN_PASSWORD;
 const CLAVIS_SHEET_URL = process.env.CLAVIS_SHEET_URL;
-const CLAVIS_SESSION_SECRET =
-  process.env.CLAVIS_SESSION_SECRET || "ExpoClavisSession2026";
 
-const TEBRP_ENABLED = String(process.env.TEBRP_ENABLED || "false") === "true";
-const TEBRP_API_KEY = process.env.TEBRP_API_KEY || "";
-const TEBRP_API_URL = process.env.TEBRP_API_URL || "";
+const SHOPIFY_SHOP_NAME = process.env.SHOPIFY_SHOP_NAME;
+const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
+const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
+const SHOPIFY_ADMIN_ACCESS_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
+const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2026-04";
 
-const ADMIN_SESSION_HOURS = 12;
+let cachedShopifyToken = null;
+let cachedShopifyTokenExpiresAt = 0;
 
 /* -------------------------------
-   ADMIN OTURUM / TOKEN
+   ADMIN OTURUM SİSTEMİ
 -------------------------------- */
 
-function base64UrlEncode(value) {
-  return Buffer.from(value)
-    .toString("base64")
-    .replaceAll("+", "-")
-    .replaceAll("/", "_")
-    .replaceAll("=", "");
+function getSessionSecret() {
+  return String(
+    process.env.CLAVIS_SESSION_SECRET ||
+      process.env.CLAVIS_ADMIN_PASSWORD ||
+      "clavis-fallback-secret"
+  );
 }
 
-function base64UrlDecode(value) {
-  value = String(value || "")
-    .replaceAll("-", "+")
-    .replaceAll("_", "/");
-
-  while (value.length % 4) value += "=";
-
-  return Buffer.from(value, "base64").toString("utf8");
-}
-
-function signPayload(payloadBase64) {
+function signToken(payloadBase64) {
   return crypto
-    .createHmac("sha256", CLAVIS_SESSION_SECRET)
+    .createHmac("sha256", getSessionSecret())
     .update(payloadBase64)
-    .digest("base64")
-    .replaceAll("+", "-")
-    .replaceAll("/", "_")
-    .replaceAll("=", "");
+    .digest("hex");
 }
 
-function createAdminToken() {
+function createSessionToken() {
   const payload = {
     role: "admin",
-    iat: Date.now(),
-    exp: Date.now() + ADMIN_SESSION_HOURS * 60 * 60 * 1000
+    exp: Date.now() + 12 * 60 * 60 * 1000
   };
 
-  const payloadBase64 = base64UrlEncode(JSON.stringify(payload));
-  const signature = signPayload(payloadBase64);
+  const payloadBase64 = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const signature = signToken(payloadBase64);
 
   return `${payloadBase64}.${signature}`;
 }
 
-function verifyAdminToken(token) {
+function verifySessionToken(token) {
   try {
-    const raw = String(token || "").trim();
-    if (!raw || !raw.includes(".")) return false;
+    const [payloadBase64, signature] = String(token || "").split(".");
 
-    const [payloadBase64, signature] = raw.split(".");
-    const expectedSignature = signPayload(payloadBase64);
+    if (!payloadBase64 || !signature) return false;
+
+    const expectedSignature = signToken(payloadBase64);
 
     if (signature !== expectedSignature) return false;
 
-    const payload = JSON.parse(base64UrlDecode(payloadBase64));
+    const payload = JSON.parse(Buffer.from(payloadBase64, "base64url").toString("utf8"));
 
-    if (payload.role !== "admin") return false;
     if (!payload.exp || Date.now() > payload.exp) return false;
 
     return true;
@@ -95,47 +85,29 @@ function verifyAdminToken(token) {
   }
 }
 
-function checkPasswordValue(password) {
-  const incoming = String(password || "").trim();
+function checkAdminPassword(req, res, next) {
+  const sessionToken = String(req.headers["x-clavis-session-token"] || "").trim();
+
+  if (sessionToken && verifySessionToken(sessionToken)) {
+    return next();
+  }
+
+  const password = String(req.headers["x-clavis-admin-password"] || "").trim();
   const realPassword = String(CLAVIS_ADMIN_PASSWORD || "").trim();
 
   if (!realPassword) {
-    return {
-      ok: false,
-      status: 500,
+    return res.status(500).json({
       error: "Admin şifresi Render Environment içinde tanımlı değil."
-    };
+    });
   }
 
-  if (!incoming || incoming !== realPassword) {
-    return {
-      ok: false,
-      status: 401,
-      error: "Yetkisiz erişim. Şifre hatalı veya eksik."
-    };
+  if (!password || password !== realPassword) {
+    return res.status(401).json({
+      error: "Yetkisiz erişim. Şifre hatalı, eksik veya oturum süresi dolmuş."
+    });
   }
 
-  return { ok: true };
-}
-
-function checkAdminAuth(req, res, next) {
-  const sessionToken = String(req.headers["x-clavis-session-token"] || "").trim();
-
-  if (verifyAdminToken(sessionToken)) {
-    return next();
-  }
-
-  // Eski sistem de çalışmaya devam etsin diye bırakıyoruz.
-  const password = String(req.headers["x-clavis-admin-password"] || "").trim();
-  const passwordCheck = checkPasswordValue(password);
-
-  if (passwordCheck.ok) {
-    return next();
-  }
-
-  return res.status(passwordCheck.status || 401).json({
-    error: passwordCheck.error || "Yetkisiz erişim."
-  });
+  return next();
 }
 
 /* -------------------------------
@@ -151,23 +123,29 @@ function normalizeText(value) {
     .replaceAll("ş", "s")
     .replaceAll("ö", "o")
     .replaceAll("ç", "c")
-    .replace(/[^\w\s-]/g, " ")
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
     .replace(/\s+/g, " ")
     .trim();
 }
 
 function toNumber(value) {
-  if (typeof value === "number") return value;
+  if (typeof value === "number") return Number.isFinite(value) ? value : 0;
 
   const cleaned = String(value || "")
     .replace("TL", "")
     .replace("₺", "")
     .replaceAll(".", "")
     .replace(",", ".")
+    .replace("%", "")
     .trim();
 
   const n = Number(cleaned);
   return Number.isFinite(n) ? n : 0;
+}
+
+function roundMoney(value) {
+  const n = Number(value || 0);
+  return Math.round(n * 100) / 100;
 }
 
 function safeJsonParse(text) {
@@ -199,142 +177,201 @@ function getField(item, possibleNames) {
   return "";
 }
 
-function uniqueById(items) {
-  const seen = new Set();
-  return items.filter((item) => {
-    const key = item.id || `${item.handle}-${item.title}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+function makeAdminSearchUrl(title) {
+  return `https://admin.shopify.com/store/${SHOPIFY_SHOP_NAME || "expo-pharma"}/products?query=${encodeURIComponent(
+    title || ""
+  )}`;
+}
+
+function makeShopUrl(handle) {
+  return `${SHOP_DOMAIN}/products/${handle || ""}`;
 }
 
 /* -------------------------------
-   GOOGLE SHEET MALİYET TABLOSU
+   SHOPIFY ADMIN API
 -------------------------------- */
 
-async function fetchCostSheet() {
-  if (!CLAVIS_SHEET_URL) {
-    return [];
+async function getShopifyAccessToken() {
+  if (SHOPIFY_ADMIN_ACCESS_TOKEN) {
+    return SHOPIFY_ADMIN_ACCESS_TOKEN;
   }
 
-  const response = await fetch(CLAVIS_SHEET_URL);
+  const now = Date.now();
 
-  if (!response.ok) {
-    throw new Error("Google Sheet maliyet tablosu okunamadı.");
+  if (cachedShopifyToken && cachedShopifyTokenExpiresAt > now + 60000) {
+    return cachedShopifyToken;
   }
 
-  const data = await response.json();
-  const items = Array.isArray(data.items) ? data.items : [];
+  if (!SHOPIFY_SHOP_NAME || !SHOPIFY_CLIENT_ID || !SHOPIFY_CLIENT_SECRET) {
+    throw new Error("Shopify Client ID, Secret veya Shop Name eksik.");
+  }
 
-  return items.map((item) => {
+  const tokenUrl = `https://${SHOPIFY_SHOP_NAME}.myshopify.com/admin/oauth/access_token`;
+
+  const body = new URLSearchParams();
+  body.set("grant_type", "client_credentials");
+  body.set("client_id", SHOPIFY_CLIENT_ID);
+  body.set("client_secret", SHOPIFY_CLIENT_SECRET);
+
+  const response = await fetch(tokenUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body
+  });
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok || !data.access_token) {
+    console.error("SHOPIFY TOKEN ERROR:", data);
+    throw new Error("Shopify access token alınamadı.");
+  }
+
+  cachedShopifyToken = data.access_token;
+  cachedShopifyTokenExpiresAt =
+    Date.now() + Number(data.expires_in || 86000) * 1000;
+
+  return cachedShopifyToken;
+}
+
+async function shopifyGraphQL(query, variables = {}) {
+  const token = await getShopifyAccessToken();
+
+  const response = await fetch(
+    `https://${SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/${SHOPIFY_API_VERSION}/graphql.json`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": token
+      },
+      body: JSON.stringify({
+        query,
+        variables
+      })
+    }
+  );
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok || data.errors) {
+    console.error("SHOPIFY GRAPHQL ERROR:", JSON.stringify(data, null, 2));
+    throw new Error("Shopify Admin API sorgusu başarısız.");
+  }
+
+  return data.data;
+}
+
+async function fetchShopifyAdminProducts() {
+  const allProducts = [];
+  let hasNextPage = true;
+  let cursor = null;
+
+  while (hasNextPage) {
+    const data = await shopifyGraphQL(
+      `
+      query GetProducts($cursor: String) {
+        products(first: 100, after: $cursor) {
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
+          edges {
+            node {
+              id
+              title
+              handle
+              vendor
+              productType
+              status
+              tags
+              featuredImage {
+                url
+              }
+              variants(first: 50) {
+                edges {
+                  node {
+                    id
+                    title
+                    sku
+                    barcode
+                    price
+                    compareAtPrice
+                    inventoryItem {
+                      id
+                      tracked
+                      unitCost {
+                        amount
+                        currencyCode
+                      }
+                    }
+                    inventoryQuantity
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      `,
+      { cursor }
+    );
+
+    const products = data.products.edges.map((edge) => edge.node);
+    allProducts.push(...products);
+
+    hasNextPage = data.products.pageInfo.hasNextPage;
+    cursor = data.products.pageInfo.endCursor;
+
+    if (allProducts.length > 5000) break;
+  }
+
+  return allProducts.map((p) => {
+    const variants = Array.isArray(p.variants?.edges)
+      ? p.variants.edges.map((e) => e.node)
+      : [];
+
+    const firstVariant = variants[0] || {};
+
+    const price = toNumber(firstVariant.price);
+    const compareAtPrice = toNumber(firstVariant.compareAtPrice);
+
     return {
-      handle: String(getField(item, ["handle", "Handle"]) || "").trim(),
-      sku: String(getField(item, ["sku", "SKU"]) || "").trim(),
-      barcode: String(getField(item, ["barkod", "barcode", "Barkod", "Barcode"]) || "").trim(),
-      productName: String(
-        getField(item, [
-          "ürün adı",
-          "urun adı",
-          "ürün adi",
-          "product name",
-          "title",
-          "Title"
-        ]) || ""
-      ).trim(),
-      supplyType: String(getField(item, ["tedarik tipi", "supply type"]) || "").trim(),
-      costPrice: toNumber(
-        getField(item, [
-          "geliş fiyatı",
-          "gelis fiyati",
-          "geliş fiyat",
-          "maliyet",
-          "cost"
-        ])
-      ),
-      psf: toNumber(getField(item, ["PSF", "psf"])),
-      minimumSalePrice: toNumber(
-        getField(item, ["minimum satış fiyatı", "minimum satis fiyati"])
-      ),
-      shippingCost: toNumber(getField(item, ["kargo maliyeti", "kargo"])),
-      paymentCommissionRate: toNumber(
-        getField(item, ["ödeme komisyonu %", "odeme komisyonu %", "komisyon %"])
-      ),
-      pharmacistCommission: toNumber(
-        getField(item, ["eczacı komisyonu", "eczaci komisyonu"])
-      ),
-      pharmacistCommissionType: String(
-        getField(item, ["eczacı komisyon tipi", "eczaci komisyon tipi"]) || "TL"
-      ).trim(),
-      targetProfitRate: toNumber(getField(item, ["hedef kâr %", "hedef kar %"])),
-      note: String(getField(item, ["not", "Not"]) || "").trim()
+      id: p.id,
+      title: p.title || "",
+      handle: p.handle || "",
+      vendor: p.vendor || "",
+      product_type: p.productType || "",
+      status: p.status || "",
+      tags: Array.isArray(p.tags) ? p.tags : [],
+      url: makeShopUrl(p.handle),
+      adminSearchUrl: makeAdminSearchUrl(p.title),
+      image: p.featuredImage?.url || "",
+      available: Number(firstVariant.inventoryQuantity || 0) > 0,
+      price,
+      compareAtPrice,
+      variants: variants.map((v) => ({
+        id: v.id,
+        title: v.title || "",
+        sku: v.sku || "",
+        barcode: v.barcode || "",
+        price: toNumber(v.price),
+        compareAtPrice: toNumber(v.compareAtPrice),
+        inventoryItemId: v.inventoryItem?.id || "",
+        inventoryTracked: Boolean(v.inventoryItem?.tracked),
+        inventoryQuantity: Number(v.inventoryQuantity || 0),
+        unitCost: toNumber(v.inventoryItem?.unitCost?.amount)
+      }))
     };
   });
 }
 
-function matchCostData(product, costItems) {
-  const productHandle = normalizeText(product.handle);
-  const productTitle = normalizeText(product.title);
-
-  const productSkuList = product.variants
-    .map((v) => normalizeText(v.sku))
-    .filter(Boolean);
-
-  const productBarcodeList = product.variants
-    .map((v) => String(v.barcode || "").trim())
-    .filter(Boolean);
-
-  return costItems.find((item) => {
-    const itemHandle = normalizeText(item.handle);
-    const itemSku = normalizeText(item.sku);
-    const itemBarcode = String(item.barcode || "").trim();
-    const itemName = normalizeText(item.productName);
-
-    if (itemHandle && itemHandle === productHandle) return true;
-    if (itemSku && productSkuList.includes(itemSku)) return true;
-    if (itemBarcode && productBarcodeList.includes(itemBarcode)) return true;
-    if (itemName && itemName === productTitle) return true;
-
-    return false;
-  });
-}
-
-function calculateProfit(product, cost) {
-  const salePrice = Number(product.price || 0);
-  const costPrice = Number(cost?.costPrice || 0);
-  const shippingCost = Number(cost?.shippingCost || 0);
-  const paymentRate = Number(cost?.paymentCommissionRate || 0);
-
-  let pharmacistCommission = Number(cost?.pharmacistCommission || 0);
-
-  if (String(cost?.pharmacistCommissionType || "").includes("%")) {
-    pharmacistCommission = salePrice * (pharmacistCommission / 100);
-  }
-
-  const paymentCommission = salePrice * (paymentRate / 100);
-
-  const netProfit =
-    salePrice -
-    costPrice -
-    shippingCost -
-    paymentCommission -
-    pharmacistCommission;
-
-  return {
-    salePrice,
-    costPrice,
-    shippingCost,
-    paymentCommission,
-    pharmacistCommission,
-    netProfit
-  };
-}
-
 /* -------------------------------
-   SHOPIFY ÜRÜNLERİNİ OKU
+   PUBLIC SHOPIFY FALLBACK
 -------------------------------- */
 
-async function fetchShopifyProducts() {
+async function fetchShopifyPublicProducts() {
   const allProducts = [];
   const limit = 250;
   let page = 1;
@@ -368,24 +405,20 @@ async function fetchShopifyProducts() {
     const price = toNumber(firstVariant.price);
     const compareAtPrice = toNumber(firstVariant.compare_at_price);
 
-    const productUrl = `${SHOP_DOMAIN}/products/${p.handle}`;
-
     return {
       id: p.id,
       title: p.title || "",
       handle: p.handle || "",
       vendor: p.vendor || "",
       product_type: p.product_type || "",
+      status: "",
       tags: Array.isArray(p.tags) ? p.tags : [],
       body_html: p.body_html || "",
-      url: productUrl,
-      adminSearchUrl: `https://admin.shopify.com/store/expo-pharma/products?query=${encodeURIComponent(
-        p.title || p.handle || ""
-      )}`,
+      url: makeShopUrl(p.handle),
+      adminSearchUrl: makeAdminSearchUrl(p.title),
       image:
         p.featured_image ||
         (Array.isArray(p.images) && p.images[0] ? p.images[0].src : ""),
-      imageCount: Array.isArray(p.images) ? p.images.length : 0,
       available: Boolean(firstVariant.available),
       price,
       compareAtPrice,
@@ -396,99 +429,227 @@ async function fetchShopifyProducts() {
         barcode: v.barcode || "",
         price: toNumber(v.price),
         compareAtPrice: toNumber(v.compare_at_price),
-        available: Boolean(v.available)
+        available: Boolean(v.available),
+        inventoryItemId: "",
+        inventoryTracked: false,
+        inventoryQuantity: 0,
+        unitCost: 0
       }))
     };
   });
 }
 
 /* -------------------------------
-   TEBRP HAZIR ALTYAPI
+   GOOGLE SHEET MALİYET TABLOSU
 -------------------------------- */
 
-async function fetchTebrpByBarcode(barcode) {
-  if (!TEBRP_ENABLED) {
-    return {
-      enabled: false,
-      found: false,
-      reason: "TEBRP bağlantısı kapalı."
-    };
+async function fetchCostSheet() {
+  if (!CLAVIS_SHEET_URL) {
+    return [];
   }
 
-  if (!TEBRP_API_URL || !TEBRP_API_KEY) {
-    return {
-      enabled: true,
-      found: false,
-      reason: "TEBRP API URL veya API KEY eksik."
-    };
-  }
-
-  const url = new URL(TEBRP_API_URL);
-  url.searchParams.set("barcode", barcode);
-  url.searchParams.set("key", TEBRP_API_KEY);
-
-  const response = await fetch(url.toString(), {
-    headers: {
-      "x-api-key": TEBRP_API_KEY
-    }
-  });
+  const response = await fetch(CLAVIS_SHEET_URL);
 
   if (!response.ok) {
-    throw new Error("TEBRP verisi alınamadı.");
+    throw new Error("Google Sheet maliyet tablosu okunamadı.");
   }
 
   const data = await response.json();
+  const items = Array.isArray(data.items) ? data.items : [];
+
+  return items.map((item) => {
+    const costPrice = toNumber(
+      getField(item, [
+        "geliş fiyatı",
+        "gelis fiyati",
+        "geliş fiyat",
+        "gelis fiyat",
+        "maliyet",
+        "cost",
+        "Cost"
+      ])
+    );
+
+    const psf = toNumber(getField(item, ["PSF", "psf"]));
+
+    const recommendedPrice = toNumber(
+      getField(item, [
+        "Shopify satış fiyatı",
+        "shopify satış fiyatı",
+        "shopify satis fiyati",
+        "önerilen fiyat",
+        "onerilen fiyat"
+      ])
+    );
+
+    return {
+      handle: String(getField(item, ["handle", "Handle"]) || "").trim(),
+      sku: String(getField(item, ["sku", "SKU"]) || "").trim(),
+      barcode: String(getField(item, ["barkod", "barcode", "Barkod", "Barcode"]) || "").trim(),
+      productName: String(
+        getField(item, [
+          "ürün adı",
+          "urun adı",
+          "ürün adi",
+          "product name",
+          "title",
+          "Title",
+          "Ürün"
+        ]) || ""
+      ).trim(),
+      supplyType: String(getField(item, ["tedarik tipi", "supply type"]) || "").trim(),
+      costPrice,
+      psf,
+      recommendedPrice,
+      compareAtPrice: psf,
+      minimumSalePrice: toNumber(
+        getField(item, ["minimum satış fiyatı", "minimum satis fiyati"])
+      ),
+      shippingCost: toNumber(getField(item, ["kargo maliyeti", "kargo"])),
+      paymentCommissionRate: toNumber(
+        getField(item, ["ödeme komisyonu %", "odeme komisyonu %", "komisyon %"])
+      ),
+      pharmacistCommission: toNumber(
+        getField(item, ["eczacı komisyonu", "eczaci komisyonu"])
+      ),
+      pharmacistCommissionType: String(
+        getField(item, ["eczacı komisyon tipi", "eczaci komisyon tipi"]) || "TL"
+      ).trim(),
+      targetProfitRate: toNumber(getField(item, ["hedef kâr %", "hedef kar %"])),
+      note: String(getField(item, ["not", "Not"]) || "").trim()
+    };
+  });
+}
+
+/* -------------------------------
+   EŞLEŞTİRME VE HESAPLAMA
+-------------------------------- */
+
+function matchCostData(product, costItems) {
+  const productHandle = normalizeText(product.handle);
+  const productTitle = normalizeText(product.title);
+
+  const productSkuList = product.variants
+    .map((v) => normalizeText(v.sku))
+    .filter(Boolean);
+
+  const productBarcodeList = product.variants
+    .map((v) => normalizeText(v.barcode))
+    .filter(Boolean);
+
+  let match = costItems.find((item) => {
+    const itemBarcode = normalizeText(item.barcode);
+    return itemBarcode && productBarcodeList.includes(itemBarcode);
+  });
+
+  if (match) return match;
+
+  match = costItems.find((item) => {
+    const itemSku = normalizeText(item.sku);
+    return itemSku && productSkuList.includes(itemSku);
+  });
+
+  if (match) return match;
+
+  match = costItems.find((item) => {
+    const itemHandle = normalizeText(item.handle);
+    return itemHandle && itemHandle === productHandle;
+  });
+
+  if (match) return match;
+
+  match = costItems.find((item) => {
+    const itemName = normalizeText(item.productName);
+    return itemName && itemName === productTitle;
+  });
+
+  if (match) return match;
+
+  match = costItems.find((item) => {
+    const itemName = normalizeText(item.productName);
+
+    if (!itemName || !productTitle) return false;
+
+    if (itemName.length > 8 && productTitle.includes(itemName)) return true;
+    if (productTitle.length > 8 && itemName.includes(productTitle)) return true;
+
+    return false;
+  });
+
+  return match || null;
+}
+
+function calculateProfit(product, cost) {
+  const salePrice = Number(product.price || 0);
+  const costPrice = Number(cost?.costPrice || 0);
+  const shippingCost = Number(cost?.shippingCost || 0);
+  const paymentRate = Number(cost?.paymentCommissionRate || 0);
+
+  let pharmacistCommission = Number(cost?.pharmacistCommission || 0);
+
+  if (String(cost?.pharmacistCommissionType || "").includes("%")) {
+    pharmacistCommission = salePrice * (pharmacistCommission / 100);
+  }
+
+  const paymentCommission = salePrice * (paymentRate / 100);
+
+  const netProfit =
+    salePrice -
+    costPrice -
+    shippingCost -
+    paymentCommission -
+    pharmacistCommission;
 
   return {
-    enabled: true,
-    found: true,
-    raw: data
+    salePrice,
+    costPrice,
+    shippingCost,
+    paymentCommission,
+    pharmacistCommission,
+    netProfit: roundMoney(netProfit)
+  };
+}
+
+function productToOperationRow(product, cost = null, profit = null) {
+  const firstVariant = product.variants[0] || {};
+  const barcode = firstVariant.barcode || cost?.barcode || "";
+  const sku = firstVariant.sku || cost?.sku || "";
+
+  const psf = Number(cost?.psf || 0);
+  const recommendedPrice =
+    Number(cost?.recommendedPrice || 0) ||
+    (psf > 0 ? roundMoney(psf * 0.95) : 0);
+
+  return {
+    id: product.id,
+    variantId: firstVariant.id || "",
+    inventoryItemId: firstVariant.inventoryItemId || "",
+    title: product.title,
+    vendor: product.vendor,
+    handle: product.handle,
+    status: product.status,
+    barcode,
+    sku,
+    shopifyPrice: Number(product.price || 0),
+    price: Number(product.price || 0),
+    compareAtPrice: Number(product.compareAtPrice || 0),
+    psf,
+    recommendedPrice,
+    costPrice: Number(cost?.costPrice || firstVariant.unitCost || 0),
+    minimumSalePrice: Number(cost?.minimumSalePrice || 0),
+    netProfit: profit ? profit.netProfit : null,
+    image: product.image || "",
+    url: product.url,
+    adminSearchUrl: product.adminSearchUrl,
+    inventoryTracked: Boolean(firstVariant.inventoryTracked),
+    inventoryQuantity: Number(firstVariant.inventoryQuantity || 0),
+    note: cost?.note || ""
   };
 }
 
 /* -------------------------------
-   DENETİM
+   DENETİM RAPORU
 -------------------------------- */
-
-function makeOperationRow(product, cost = null, profit = null, extra = {}) {
-  const firstVariant = product.variants?.[0] || {};
-  const psf = Number(cost?.psf || 0);
-  const recommendedPrice = psf > 0 ? Math.round(psf * 0.95 * 100) / 100 : 0;
-
-  return {
-    id: product.id,
-    title: product.title,
-    handle: product.handle,
-    vendor: product.vendor,
-    product_type: product.product_type,
-    url: product.url,
-    adminSearchUrl: product.adminSearchUrl,
-    image: product.image,
-    imageCount: product.imageCount,
-    available: product.available,
-
-    sku: firstVariant.sku || "",
-    barcode: firstVariant.barcode || "",
-
-    shopifyPrice: product.price,
-    compareAtPrice: product.compareAtPrice,
-
-    psf,
-    recommendedPrice,
-
-    costPrice: Number(cost?.costPrice || 0),
-    minimumSalePrice: Number(cost?.minimumSalePrice || 0),
-    shippingCost: Number(cost?.shippingCost || 0),
-    paymentCommissionRate: Number(cost?.paymentCommissionRate || 0),
-    targetProfitRate: Number(cost?.targetProfitRate || 0),
-
-    netProfit: profit ? Math.round(profit.netProfit * 100) / 100 : null,
-
-    costMatched: Boolean(cost),
-    note: cost?.note || "",
-    ...extra
-  };
-}
 
 function auditProducts(products, costItems, options = {}) {
   const minSuspiciousPrice = Number(options.minSuspiciousPrice || 10);
@@ -496,13 +657,13 @@ function auditProducts(products, costItems, options = {}) {
   const zeroPrice = [];
   const missingImage = [];
   const missingHandle = [];
+  const missingBarcode = [];
   const suspiciousLowPrice = [];
   const compareAtProblem = [];
   const variantPriceMismatch = [];
 
   const missingCost = [];
   const missingPsf = [];
-  const missingBarcode = [];
   const belowCost = [];
   const lowProfit = [];
   const belowMinimumSalePrice = [];
@@ -512,9 +673,7 @@ function auditProducts(products, costItems, options = {}) {
   products.forEach((product) => {
     const cost = matchCostData(product, costItems);
     const profit = cost ? calculateProfit(product, cost) : null;
-    const row = makeOperationRow(product, cost, profit);
-
-    const allBarcodes = product.variants.map((v) => v.barcode).filter(Boolean);
+    const row = productToOperationRow(product, cost, profit);
 
     if (!product.handle) {
       missingHandle.push(row);
@@ -524,12 +683,14 @@ function auditProducts(products, costItems, options = {}) {
       missingImage.push(row);
     }
 
-    if (!product.price || product.price <= 0) {
-      zeroPrice.push(row);
+    const hasAnyBarcode = product.variants.some((v) => String(v.barcode || "").trim());
+
+    if (!hasAnyBarcode) {
+      missingBarcode.push(row);
     }
 
-    if (allBarcodes.length === 0) {
-      missingBarcode.push(row);
+    if (!product.price || product.price <= 0) {
+      zeroPrice.push(row);
     }
 
     if (product.price > 0 && product.price < minSuspiciousPrice) {
@@ -611,33 +772,72 @@ function auditProducts(products, costItems, options = {}) {
 
       missingCostCount: missingCost.length,
       missingPsfCount: missingPsf.length,
-
       belowCostCount: belowCost.length,
       lowProfitCount: lowProfit.length,
       belowMinimumSalePriceCount: belowMinimumSalePrice.length,
-
       psfAboveCount: psfAbove.length,
       psfBelowCount: psfBelow.length
     },
 
-    zeroPrice: uniqueById(zeroPrice),
-    missingImage: uniqueById(missingImage),
-    missingHandle: uniqueById(missingHandle),
-    missingBarcode: uniqueById(missingBarcode),
+    zeroPrice,
+    missingImage,
+    missingHandle,
+    missingBarcode,
+    suspiciousLowPrice,
+    compareAtProblem,
+    variantPriceMismatch,
+    missingCost,
+    missingPsf,
+    belowCost,
+    lowProfit,
+    belowMinimumSalePrice,
+    psfAbove,
+    psfBelow
+  };
+}
 
-    suspiciousLowPrice: uniqueById(suspiciousLowPrice),
-    compareAtProblem: uniqueById(compareAtProblem),
-    variantPriceMismatch: uniqueById(variantPriceMismatch),
-
-    missingCost: uniqueById(missingCost),
-    missingPsf: uniqueById(missingPsf),
-
-    belowCost: uniqueById(belowCost),
-    lowProfit: uniqueById(lowProfit),
-    belowMinimumSalePrice: uniqueById(belowMinimumSalePrice),
-
-    psfAbove: uniqueById(psfAbove),
-    psfBelow: uniqueById(psfBelow)
+function buildOperationSections(report) {
+  return {
+    zeroPrice: {
+      title: "Fiyatı 0 / boş görünen ürünler",
+      count: report.zeroPrice.length,
+      items: report.zeroPrice
+    },
+    missingCost: {
+      title: "Maliyet bilgisi eksik ürünler",
+      count: report.missingCost.length,
+      items: report.missingCost
+    },
+    missingPsf: {
+      title: "PSF bilgisi eksik ürünler",
+      count: report.missingPsf.length,
+      items: report.missingPsf
+    },
+    missingImage: {
+      title: "Görseli eksik ürünler",
+      count: report.missingImage.length,
+      items: report.missingImage
+    },
+    missingBarcode: {
+      title: "Barkodu eksik ürünler",
+      count: report.missingBarcode.length,
+      items: report.missingBarcode
+    },
+    psfAbove: {
+      title: "PSF üstünde satışta olan ürünler",
+      count: report.psfAbove.length,
+      items: report.psfAbove
+    },
+    psfBelow: {
+      title: "PSF altında satışta olan ürünler",
+      count: report.psfBelow.length,
+      items: report.psfBelow
+    },
+    belowCost: {
+      title: "Zarar riski olan ürünler",
+      count: report.belowCost.length,
+      items: report.belowCost
+    }
   };
 }
 
@@ -646,7 +846,14 @@ function auditProducts(products, costItems, options = {}) {
 -------------------------------- */
 
 async function matchProductsFromShopify(answerText) {
-  const products = await fetchShopifyProducts();
+  let products = [];
+
+  try {
+    products = await fetchShopifyAdminProducts();
+  } catch {
+    products = await fetchShopifyPublicProducts();
+  }
+
   const normalizedAnswer = normalizeText(answerText);
 
   const keywords = [
@@ -690,7 +897,6 @@ async function matchProductsFromShopify(answerText) {
       ${product.vendor}
       ${product.product_type}
       ${product.tags.join(" ")}
-      ${product.body_html}
     `);
 
     let score = 0;
@@ -726,11 +932,11 @@ app.get("/", (req, res) => {
   res.json({
     status: "CLAVIS AI backend aktif",
     health: "/health",
-    login: "/api/admin-login",
-    session: "/api/admin-session",
-    products: "/api/shopify-products",
+    adminLogin: "/api/admin-login",
+    adminSession: "/api/admin-session",
+    shopifyAdminTest: "/api/shopify-admin-test",
+    productOperations: "/api/product-operations",
     priceAudit: "/api/price-audit",
-    operations: "/api/product-operations",
     costSheet: "/api/cost-sheet"
   });
 });
@@ -744,41 +950,90 @@ app.get("/health", (req, res) => {
 -------------------------------- */
 
 app.post("/api/admin-login", (req, res) => {
-  const password =
-    req.body?.password ||
-    req.headers["x-clavis-admin-password"] ||
-    "";
+  const password = String(req.body?.password || "").trim();
+  const realPassword = String(CLAVIS_ADMIN_PASSWORD || "").trim();
 
-  const passwordCheck = checkPasswordValue(password);
-
-  if (!passwordCheck.ok) {
-    return res.status(passwordCheck.status || 401).json({
-      ok: false,
-      error: passwordCheck.error
+  if (!realPassword) {
+    return res.status(500).json({
+      error: "Admin şifresi Render Environment içinde tanımlı değil."
     });
   }
 
-  const token = createAdminToken();
+  if (!password || password !== realPassword) {
+    return res.status(401).json({
+      error: "Şifre hatalı."
+    });
+  }
 
   return res.json({
-    ok: true,
-    token,
-    expiresInHours: ADMIN_SESSION_HOURS
+    status: "ok",
+    token: createSessionToken()
   });
 });
 
-app.get("/api/admin-session", checkAdminAuth, (req, res) => {
+app.get("/api/admin-session", checkAdminPassword, (req, res) => {
   return res.json({
-    ok: true,
-    authenticated: true
+    status: "ok"
   });
 });
 
 /* -------------------------------
-   ADMIN VERİ ENDPOINTLERİ
+   ADMIN ENDPOINTLERİ
 -------------------------------- */
 
-app.get("/api/cost-sheet", checkAdminAuth, async (req, res) => {
+app.get("/api/shopify-admin-test", checkAdminPassword, async (req, res) => {
+  try {
+    const data = await shopifyGraphQL(`
+      query {
+        shop {
+          name
+          myshopifyDomain
+        }
+        products(first: 1) {
+          edges {
+            node {
+              id
+              title
+              handle
+              variants(first: 1) {
+                edges {
+                  node {
+                    id
+                    sku
+                    barcode
+                    price
+                    compareAtPrice
+                    inventoryItem {
+                      id
+                      tracked
+                      unitCost {
+                        amount
+                        currencyCode
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    `);
+
+    return res.json({
+      status: "ok",
+      shop: data.shop,
+      sampleProduct: data.products.edges[0]?.node || null
+    });
+  } catch (error) {
+    console.error("SHOPIFY ADMIN TEST ERROR:", error);
+    return res.status(500).json({
+      error: error.message || "Shopify Admin API test başarısız."
+    });
+  }
+});
+
+app.get("/api/cost-sheet", checkAdminPassword, async (req, res) => {
   try {
     const costItems = await fetchCostSheet();
 
@@ -794,9 +1049,16 @@ app.get("/api/cost-sheet", checkAdminAuth, async (req, res) => {
   }
 });
 
-app.get("/api/shopify-products", checkAdminAuth, async (req, res) => {
+app.get("/api/shopify-products", checkAdminPassword, async (req, res) => {
   try {
-    const products = await fetchShopifyProducts();
+    let products = [];
+
+    try {
+      products = await fetchShopifyAdminProducts();
+    } catch (adminError) {
+      console.error("ADMIN SHOPIFY READ FAILED, FALLBACK PUBLIC:", adminError);
+      products = await fetchShopifyPublicProducts();
+    }
 
     return res.json({
       count: products.length,
@@ -810,10 +1072,19 @@ app.get("/api/shopify-products", checkAdminAuth, async (req, res) => {
   }
 });
 
-app.get("/api/price-audit", checkAdminAuth, async (req, res) => {
+app.get("/api/price-audit", checkAdminPassword, async (req, res) => {
   try {
     const minSuspiciousPrice = req.query.minPrice || 10;
-    const products = await fetchShopifyProducts();
+
+    let products = [];
+
+    try {
+      products = await fetchShopifyAdminProducts();
+    } catch (adminError) {
+      console.error("ADMIN SHOPIFY READ FAILED, FALLBACK PUBLIC:", adminError);
+      products = await fetchShopifyPublicProducts();
+    }
+
     const costItems = await fetchCostSheet();
     const report = auditProducts(products, costItems, { minSuspiciousPrice });
 
@@ -826,82 +1097,181 @@ app.get("/api/price-audit", checkAdminAuth, async (req, res) => {
   }
 });
 
-app.get("/api/product-operations", checkAdminAuth, async (req, res) => {
+app.get("/api/product-operations", checkAdminPassword, async (req, res) => {
   try {
-    const products = await fetchShopifyProducts();
+    let source = "admin-api";
+    let products = [];
+
+    try {
+      products = await fetchShopifyAdminProducts();
+    } catch (adminError) {
+      console.error("ADMIN SHOPIFY READ FAILED, FALLBACK PUBLIC:", adminError);
+      source = "public-products-json";
+      products = await fetchShopifyPublicProducts();
+    }
+
     const costItems = await fetchCostSheet();
     const report = auditProducts(products, costItems);
 
     return res.json({
+      source,
       summary: report.summary,
-      sections: {
-        zeroPrice: {
-          title: "Fiyatı 0 / boş olan ürünler",
-          count: report.zeroPrice.length,
-          items: report.zeroPrice
-        },
-        missingCost: {
-          title: "Maliyet bilgisi eksik ürünler",
-          count: report.missingCost.length,
-          items: report.missingCost
-        },
-        missingPsf: {
-          title: "PSF eksik ürünler",
-          count: report.missingPsf.length,
-          items: report.missingPsf
-        },
-        missingImage: {
-          title: "Görseli eksik ürünler",
-          count: report.missingImage.length,
-          items: report.missingImage
-        },
-        missingBarcode: {
-          title: "Barkodu eksik ürünler",
-          count: report.missingBarcode.length,
-          items: report.missingBarcode
-        },
-        psfAbove: {
-          title: "PSF üstünde satışta olan ürünler",
-          count: report.psfAbove.length,
-          items: report.psfAbove
-        },
-        psfBelow: {
-          title: "PSF altında satışta olan ürünler",
-          count: report.psfBelow.length,
-          items: report.psfBelow
-        },
-        belowCost: {
-          title: "Zarar riski olan ürünler",
-          count: report.belowCost.length,
-          items: report.belowCost
-        }
-      }
+      sections: buildOperationSections(report)
     });
   } catch (error) {
     console.error("PRODUCT OPERATIONS ERROR:", error);
     return res.status(500).json({
-      error: "Ürün operasyon paneli oluşturulamadı."
+      error: "Ürün operasyon raporu oluşturulamadı."
     });
   }
 });
 
-app.get("/api/tebrp/barcode/:barcode", checkAdminAuth, async (req, res) => {
-  try {
-    const barcode = String(req.params.barcode || "").trim();
+/* -------------------------------
+   SHOPIFY YAZMA ENDPOINTLERİ
+-------------------------------- */
 
-    if (!barcode) {
+app.post("/api/update-variant-basic", checkAdminPassword, async (req, res) => {
+  try {
+    const {
+      variantId,
+      price,
+      compareAtPrice,
+      barcode,
+      sku
+    } = req.body || {};
+
+    if (!variantId) {
       return res.status(400).json({
-        error: "Barkod eksik."
+        error: "variantId eksik."
       });
     }
 
-    const result = await fetchTebrpByBarcode(barcode);
+    const input = {
+      id: variantId
+    };
 
-    return res.json(result);
+    if (price !== undefined && price !== null && price !== "") {
+      input.price = String(roundMoney(toNumber(price)));
+    }
+
+    if (compareAtPrice !== undefined && compareAtPrice !== null && compareAtPrice !== "") {
+      input.compareAtPrice = String(roundMoney(toNumber(compareAtPrice)));
+    }
+
+    if (barcode !== undefined) {
+      input.barcode = String(barcode || "").trim();
+    }
+
+    if (sku !== undefined) {
+      input.sku = String(sku || "").trim();
+    }
+
+    const data = await shopifyGraphQL(
+      `
+      mutation productVariantUpdate($input: ProductVariantInput!) {
+        productVariantUpdate(input: $input) {
+          productVariant {
+            id
+            price
+            compareAtPrice
+            barcode
+            sku
+          }
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+      `,
+      { input }
+    );
+
+    const errors = data.productVariantUpdate.userErrors || [];
+
+    if (errors.length) {
+      return res.status(400).json({
+        error: errors.map((e) => e.message).join(", ")
+      });
+    }
+
+    return res.json({
+      status: "ok",
+      variant: data.productVariantUpdate.productVariant
+    });
   } catch (error) {
-    console.error("TEBRP ERROR:", error);
+    console.error("UPDATE VARIANT ERROR:", error);
     return res.status(500).json({
-      error: "TEBRP verisi alınamadı."
+      error: error.message || "Varyant güncellenemedi."
+    });
+  }
+});
+
+app.post("/api/update-inventory-item", checkAdminPassword, async (req, res) => {
+  try {
+    const {
+      inventoryItemId,
+      tracked,
+      cost
+    } = req.body || {};
+
+    if (!inventoryItemId) {
+      return res.status(400).json({
+        error: "inventoryItemId eksik."
+      });
+    }
+
+    const input = {};
+
+    if (tracked !== undefined) {
+      input.tracked = Boolean(tracked);
+    }
+
+    if (cost !== undefined && cost !== null && cost !== "") {
+      input.cost = String(roundMoney(toNumber(cost)));
+    }
+
+    const data = await shopifyGraphQL(
+      `
+      mutation inventoryItemUpdate($id: ID!, $input: InventoryItemInput!) {
+        inventoryItemUpdate(id: $id, input: $input) {
+          inventoryItem {
+            id
+            tracked
+            unitCost {
+              amount
+              currencyCode
+            }
+          }
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+      `,
+      {
+        id: inventoryItemId,
+        input
+      }
+    );
+
+    const errors = data.inventoryItemUpdate.userErrors || [];
+
+    if (errors.length) {
+      return res.status(400).json({
+        error: errors.map((e) => e.message).join(", ")
+      });
+    }
+
+    return res.json({
+      status: "ok",
+      inventoryItem: data.inventoryItemUpdate.inventoryItem
+    });
+  } catch (error) {
+    console.error("UPDATE INVENTORY ITEM ERROR:", error);
+    return res.status(500).json({
+      error: error.message || "Inventory item güncellenemedi."
     });
   }
 });
