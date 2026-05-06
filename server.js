@@ -1147,6 +1147,70 @@ app.post("/api/update-variant-basic", checkAdminPassword, async (req, res) => {
       });
     }
 
+    const token = await getShopifyAccessToken();
+
+    const numericVariantId = String(variantId).split("/").pop();
+
+    const variant = {
+      id: Number(numericVariantId)
+    };
+
+    if (price !== undefined && price !== null && price !== "") {
+      variant.price = String(roundMoney(toNumber(price)));
+    }
+
+    if (compareAtPrice !== undefined && compareAtPrice !== null && compareAtPrice !== "") {
+      variant.compare_at_price = String(roundMoney(toNumber(compareAtPrice)));
+    }
+
+    if (compareAtPrice === "") {
+      variant.compare_at_price = null;
+    }
+
+    if (barcode !== undefined) {
+      variant.barcode = String(barcode || "").trim();
+    }
+
+    if (sku !== undefined) {
+      variant.sku = String(sku || "").trim();
+    }
+
+    const response = await fetch(
+      `https://${SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/${SHOPIFY_API_VERSION}/variants/${numericVariantId}.json`,
+      {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Shopify-Access-Token": token
+        },
+        body: JSON.stringify({
+          variant
+        })
+      }
+    );
+
+    const data = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      console.error("SHOPIFY REST VARIANT UPDATE ERROR:", data);
+      return res.status(500).json({
+        error: data.errors ? JSON.stringify(data.errors) : "Shopify varyant güncellemesi başarısız."
+      });
+    }
+
+    return res.json({
+      status: "ok",
+      variant: data.variant
+    });
+  } catch (error) {
+    console.error("UPDATE VARIANT REST ERROR:", error);
+    return res.status(500).json({
+      error: error.message || "Varyant güncellenemedi."
+    });
+  }
+});
+    }
+
     const input = {
       id: variantId
     };
