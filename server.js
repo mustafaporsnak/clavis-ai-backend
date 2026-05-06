@@ -29,7 +29,7 @@ const SHOPIFY_SHOP_NAME = process.env.SHOPIFY_SHOP_NAME;
 const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
 const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
 const SHOPIFY_ADMIN_ACCESS_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
-const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2026-04";
+const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2025-10";
 
 let cachedShopifyToken = null;
 let cachedShopifyTokenExpiresAt = 0;
@@ -208,18 +208,16 @@ async function getShopifyAccessToken() {
 
   const tokenUrl = `https://${SHOPIFY_SHOP_NAME}.myshopify.com/admin/oauth/access_token`;
 
-  const body = JSON.stringify({
-  grant_type: "client_credentials",
-  client_id: SHOPIFY_CLIENT_ID,
-  client_secret: SHOPIFY_CLIENT_SECRET
-});
-
   const response = await fetch(tokenUrl, {
     method: "POST",
     headers: {
-  "Content-Type": "application/json"
-},
-body
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      grant_type: "client_credentials",
+      client_id: SHOPIFY_CLIENT_ID,
+      client_secret: SHOPIFY_CLIENT_SECRET
+    })
   });
 
   const data = await response.json().catch(() => ({}));
@@ -262,6 +260,37 @@ async function shopifyGraphQL(query, variables = {}) {
   }
 
   return data.data;
+}
+
+async function shopifyRest(path, options = {}) {
+  const token = await getShopifyAccessToken();
+
+  const response = await fetch(
+    `https://${SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/${SHOPIFY_API_VERSION}${path}`,
+    {
+      ...options,
+      headers: {
+        "Content-Type": "application/json",
+        "X-Shopify-Access-Token": token,
+        ...(options.headers || {})
+      }
+    }
+  );
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    console.error("SHOPIFY REST ERROR:", JSON.stringify(data, null, 2));
+    throw new Error(
+      data.errors
+        ? typeof data.errors === "string"
+          ? data.errors
+          : JSON.stringify(data.errors)
+        : "Shopify REST işlemi başarısız."
+    );
+  }
+
+  return data;
 }
 
 async function fetchShopifyAdminProducts() {
@@ -424,7 +453,7 @@ async function fetchShopifyPublicProducts() {
       price,
       compareAtPrice,
       variants: variants.map((v) => ({
-        id: v.id,
+        id: String(v.id || ""),
         title: v.title || "",
         sku: v.sku || "",
         barcode: v.barcode || "",
@@ -938,7 +967,8 @@ app.get("/", (req, res) => {
     shopifyAdminTest: "/api/shopify-admin-test",
     productOperations: "/api/product-operations",
     priceAudit: "/api/price-audit",
-    costSheet: "/api/cost-sheet"
+    costSheet: "/api/cost-sheet",
+    updateVariant: "/api/update-variant-basic"
   });
 });
 
@@ -1133,13 +1163,7 @@ app.get("/api/product-operations", checkAdminPassword, async (req, res) => {
 
 app.post("/api/update-variant-basic", checkAdminPassword, async (req, res) => {
   try {
-    const {
-      variantId,
-      price,
-      compareAtPrice,
-      barcode,
-      sku
-    } = req.body || {};
+    const { variantId, price, compareAtPrice, barcode, sku } = req.body || {};
 
     if (!variantId) {
       return res.status(400).json({
@@ -1147,9 +1171,13 @@ app.post("/api/update-variant-basic", checkAdminPassword, async (req, res) => {
       });
     }
 
-    const token = await getShopifyAccessToken();
-
     const numericVariantId = String(variantId).split("/").pop();
+
+    if (!numericVariantId || Number.isNaN(Number(numericVariantId))) {
+      return res.status(400).json({
+        error: "variantId formatı hatalı."
+      });
+    }
 
     const variant = {
       id: Number(numericVariantId)
@@ -1175,110 +1203,28 @@ app.post("/api/update-variant-basic", checkAdminPassword, async (req, res) => {
       variant.sku = String(sku || "").trim();
     }
 
-    const response = await fetch(
-      `https://${SHOPIFY_SHOP_NAME}.myshopify.com/admin/api/${SHOPIFY_API_VERSION}/variants/${numericVariantId}.json`,
-      {
-        method: "PUT",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Shopify-Access-Token": token
-        },
-        body: JSON.stringify({
-          variant
-        })
-      }
-    );
-
-    const data = await response.json().catch(() => ({}));
-
-    if (!response.ok) {
-      console.error("SHOPIFY REST VARIANT UPDATE ERROR:", data);
-      return res.status(500).json({
-        error: data.errors ? JSON.stringify(data.errors) : "Shopify varyant güncellemesi başarısız."
-      });
-    }
+    const data = await shopifyRest(`/variants/${numericVariantId}.json`, {
+      method: "PUT",
+      body: JSON.stringify({
+        variant
+      })
+    });
 
     return res.json({
       status: "ok",
       variant: data.variant
     });
   } catch (error) {
-    console.error("UPDATE VARIANT REST ERROR:", error);
+    console.error("UPDATE VARIANT BASIC ERROR:", error);
     return res.status(500).json({
-      error: error.message || "Varyant güncellenemedi."
-    });
-  }
-});
-    }
-
-    const input = {
-      id: variantId
-    };
-
-    if (price !== undefined && price !== null && price !== "") {
-      input.price = String(roundMoney(toNumber(price)));
-    }
-
-    if (compareAtPrice !== undefined && compareAtPrice !== null && compareAtPrice !== "") {
-      input.compareAtPrice = String(roundMoney(toNumber(compareAtPrice)));
-    }
-
-    if (barcode !== undefined) {
-      input.barcode = String(barcode || "").trim();
-    }
-
-    if (sku !== undefined) {
-      input.sku = String(sku || "").trim();
-    }
-
-    const data = await shopifyGraphQL(
-      `
-      mutation productVariantUpdate($input: ProductVariantInput!) {
-        productVariantUpdate(input: $input) {
-          productVariant {
-            id
-            price
-            compareAtPrice
-            barcode
-            sku
-          }
-          userErrors {
-            field
-            message
-          }
-        }
-      }
-      `,
-      { input }
-    );
-
-    const errors = data.productVariantUpdate.userErrors || [];
-
-    if (errors.length) {
-      return res.status(400).json({
-        error: errors.map((e) => e.message).join(", ")
-      });
-    }
-
-    return res.json({
-      status: "ok",
-      variant: data.productVariantUpdate.productVariant
-    });
-  } catch (error) {
-    console.error("UPDATE VARIANT ERROR:", error);
-    return res.status(500).json({
-      error: error.message || "Varyant güncellenemedi."
+      error: error.message || "Shopify varyant güncellemesi başarısız."
     });
   }
 });
 
 app.post("/api/update-inventory-item", checkAdminPassword, async (req, res) => {
   try {
-    const {
-      inventoryItemId,
-      tracked,
-      cost
-    } = req.body || {};
+    const { inventoryItemId, tracked, cost } = req.body || {};
 
     if (!inventoryItemId) {
       return res.status(400).json({
