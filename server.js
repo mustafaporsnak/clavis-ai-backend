@@ -208,17 +208,18 @@ async function getShopifyAccessToken() {
 
   const tokenUrl = `https://${SHOPIFY_SHOP_NAME}.myshopify.com/admin/oauth/access_token`;
 
-  const body = new URLSearchParams();
-  body.set("grant_type", "client_credentials");
-  body.set("client_id", SHOPIFY_CLIENT_ID);
-  body.set("client_secret", SHOPIFY_CLIENT_SECRET);
+  const body = JSON.stringify({
+  grant_type: "client_credentials",
+  client_id: SHOPIFY_CLIENT_ID,
+  client_secret: SHOPIFY_CLIENT_SECRET
+});
 
   const response = await fetch(tokenUrl, {
     method: "POST",
     headers: {
-      "Content-Type": "application/x-www-form-urlencoded"
-    },
-    body
+  "Content-Type": "application/json"
+},
+body
   });
 
   const data = await response.json().catch(() => ({}));
