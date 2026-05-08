@@ -705,23 +705,13 @@ function auditProducts(products, costItems, options = {}) {
     const profit = cost ? calculateProfit(product, cost) : null;
     const row = productToOperationRow(product, cost, profit);
 
-    if (!product.handle) {
-      missingHandle.push(row);
-    }
-
-    if (!product.image) {
-      missingImage.push(row);
-    }
+    if (!product.handle) missingHandle.push(row);
+    if (!product.image) missingImage.push(row);
 
     const hasAnyBarcode = product.variants.some((v) => String(v.barcode || "").trim());
+    if (!hasAnyBarcode) missingBarcode.push(row);
 
-    if (!hasAnyBarcode) {
-      missingBarcode.push(row);
-    }
-
-    if (!product.price || product.price <= 0) {
-      zeroPrice.push(row);
-    }
+    if (!product.price || product.price <= 0) zeroPrice.push(row);
 
     if (product.price > 0 && product.price < minSuspiciousPrice) {
       suspiciousLowPrice.push(row);
@@ -757,13 +747,9 @@ function auditProducts(products, costItems, options = {}) {
       return;
     }
 
-    if (!cost.psf || cost.psf <= 0) {
-      missingPsf.push(row);
-    }
+    if (!cost.psf || cost.psf <= 0) missingPsf.push(row);
 
-    if (cost.psf > 0 && product.price > cost.psf) {
-      psfAbove.push(row);
-    }
+    if (cost.psf > 0 && product.price > cost.psf) psfAbove.push(row);
 
     if (cost.psf > 0 && product.price > 0 && product.price < cost.psf) {
       psfBelow.push(row);
@@ -790,16 +776,13 @@ function auditProducts(products, costItems, options = {}) {
     summary: {
       totalProducts: products.length,
       costRows: costItems.length,
-
       zeroPriceCount: zeroPrice.length,
       missingImageCount: missingImage.length,
       missingHandleCount: missingHandle.length,
       missingBarcodeCount: missingBarcode.length,
-
       suspiciousLowPriceCount: suspiciousLowPrice.length,
       compareAtProblemCount: compareAtProblem.length,
       variantPriceMismatchCount: variantPriceMismatch.length,
-
       missingCostCount: missingCost.length,
       missingPsfCount: missingPsf.length,
       belowCostCount: belowCost.length,
@@ -808,7 +791,6 @@ function auditProducts(products, costItems, options = {}) {
       psfAboveCount: psfAbove.length,
       psfBelowCount: psfBelow.length
     },
-
     zeroPrice,
     missingImage,
     missingHandle,
@@ -886,39 +868,150 @@ async function matchProductsFromShopify(answerText) {
 
   const normalizedAnswer = normalizeText(answerText);
 
-  const keywords = [
-    "sivilce",
-    "akne",
-    "yağlı",
-    "yagli",
-    "karma",
-    "gözenek",
-    "gozenek",
-    "leke",
-    "güneş",
-    "gunes",
-    "spf",
-    "hassas",
-    "kızarıklık",
-    "kizariklik",
-    "kuruluk",
-    "nem",
-    "bariyer",
-    "vitamin",
-    "takviye",
-    "omega",
-    "kolajen",
-    "saç",
-    "sac",
-    "bebek",
-    "pişik",
-    "pisik",
-    "medikal",
-    "tansiyon",
-    "şeker",
-    "seker",
-    "ateş",
-    "ates"
+  function hasAny(words) {
+    return words.some((word) => normalizedAnswer.includes(normalizeText(word)));
+  }
+
+  function productHasTag(product, tag) {
+    const wanted = String(tag || "").toLowerCase().trim();
+
+    return (product.tags || []).some((t) => {
+      return String(t || "").toLowerCase().trim() === wanted;
+    });
+  }
+
+  function productHasAnyTag(product, tags) {
+    return tags.some((tag) => productHasTag(product, tag));
+  }
+
+  function detectIntent() {
+    const intent = {
+      categories: [],
+      needs: [],
+      subs: [],
+      skin: [],
+      forms: []
+    };
+
+    if (
+      hasAny([
+        "sivilce", "akne", "komedon", "gözenek", "gozenek",
+        "leke", "kızarıklık", "kizariklik", "cilt", "yüz", "yuz",
+        "nem", "kuruluk", "hassas", "spf", "güneş", "gunes",
+        "serum", "krem", "temizleyici", "tonik", "bariyer"
+      ])
+    ) {
+      intent.categories.push("cat_dermokozmetik");
+    }
+
+    if (hasAny(["sivilce", "akne", "komedon", "gözenek", "gozenek"])) {
+      intent.needs.push("need_akne");
+      intent.skin.push("skin_yagli", "skin_karma");
+    }
+
+    if (hasAny(["leke", "lekelenme", "pigment", "koyu leke"])) {
+      intent.needs.push("need_leke");
+    }
+
+    if (hasAny(["güneş", "gunes", "spf", "koruyucu", "güneş kremi", "gunes kremi"])) {
+      intent.needs.push("need_gunes_koruma");
+      intent.subs.push("sub_gunes_koruyucu");
+    }
+
+    if (hasAny(["kuru", "kuruluk", "nem", "nemlendirici", "bariyer"])) {
+      intent.needs.push("need_nem");
+      intent.skin.push("skin_kuru");
+    }
+
+    if (hasAny(["hassas", "kızarıklık", "kizariklik", "yanma", "tahriş", "tahris"])) {
+      intent.needs.push("need_hassas_cilt");
+      intent.skin.push("skin_hassas");
+    }
+
+    if (hasAny(["temizleyici", "yıkama", "yikama", "jel"])) {
+      intent.subs.push("sub_cilt_temizleyici");
+      intent.forms.push("form_gel");
+    }
+
+    if (hasAny(["serum"])) {
+      intent.forms.push("form_serum");
+    }
+
+    if (hasAny(["krem"])) {
+      intent.forms.push("form_krem");
+    }
+
+    if (
+      hasAny([
+        "bebek", "çocuk", "cocuk", "pişik", "pisik", "emzik",
+        "biberon", "mama", "anne", "emzirme", "süt", "sut"
+      ])
+    ) {
+      intent.categories.push("cat_anne_bebek");
+    }
+
+    if (hasAny(["pişik", "pisik"])) {
+      intent.needs.push("need_pisik");
+    }
+
+    if (
+      hasAny([
+        "vitamin", "takviye", "omega", "kolajen", "collagen",
+        "magnezyum", "magnesium", "probiyotik", "probiotic",
+        "çinko", "cinko", "d vitamini", "b12", "demir",
+        "multivitamin", "bağışıklık", "bagisiklik"
+      ])
+    ) {
+      intent.categories.push("cat_vitamin_takviye");
+    }
+
+    if (hasAny(["omega", "balık yağı", "balik yagi", "krill"])) {
+      intent.subs.push("sub_omega3");
+    }
+
+    if (hasAny(["kolajen", "collagen"])) {
+      intent.subs.push("sub_kolajen");
+    }
+
+    if (hasAny(["magnezyum", "magnesium"])) {
+      intent.subs.push("sub_magnezyum");
+    }
+
+    if (hasAny(["probiyotik", "probiotic", "sindirim"])) {
+      intent.subs.push("sub_probiyotik");
+    }
+
+    if (
+      hasAny([
+        "tansiyon", "şeker ölçüm", "seker olcum", "glukometre",
+        "ateş ölçer", "ates olcer", "nebülizatör", "nebulizator",
+        "oksimetre", "medikal cihaz", "strip"
+      ])
+    ) {
+      intent.categories.push("cat_medikal");
+    }
+
+    if (hasAny(["tansiyon"])) {
+      intent.subs.push("sub_tansiyon");
+    }
+
+    if (hasAny(["şeker", "seker", "glukometre", "strip"])) {
+      intent.subs.push("sub_seker_olcum");
+    }
+
+    return intent;
+  }
+
+  const intent = detectIntent();
+
+  const categoryTags = [...new Set(intent.categories)];
+  const detailTags = [
+    ...new Set([
+      ...intent.needs,
+      ...intent.subs,
+      ...intent.skin,
+      ...intent.forms
+    ])
   ];
 
   const scored = products.map((product) => {
@@ -926,21 +1019,41 @@ async function matchProductsFromShopify(answerText) {
       ${product.title}
       ${product.vendor}
       ${product.product_type}
-      ${product.tags.join(" ")}
+      ${(product.tags || []).join(" ")}
     `);
 
     let score = 0;
 
-    keywords.forEach((keyword) => {
-      const k = normalizeText(keyword);
+    if (categoryTags.length > 0) {
+      if (productHasAnyTag(product, categoryTags)) {
+        score += 50;
+      } else {
+        score -= 100;
+      }
+    }
 
+    detailTags.forEach((tag) => {
+      if (productHasTag(product, tag)) {
+        score += 18;
+      }
+    });
+
+    const softKeywords = [
+      "sivilce", "akne", "leke", "güneş", "gunes", "spf",
+      "nem", "hassas", "bebek", "pişik", "pisik",
+      "omega", "kolajen", "magnezyum", "tansiyon"
+    ];
+
+    softKeywords.forEach((keyword) => {
+      const k = normalizeText(keyword);
       if (normalizedAnswer.includes(k) && searchText.includes(k)) {
         score += 4;
       }
     });
 
-    if (product.available) score += 1;
-    if (product.price > 0) score += 1;
+    if (product.available) score += 3;
+    if (product.price > 0) score += 2;
+    if (product.image) score += 1;
 
     return {
       ...product,
