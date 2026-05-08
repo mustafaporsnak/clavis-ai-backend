@@ -31,6 +31,8 @@ const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
 const SHOPIFY_ADMIN_ACCESS_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
 const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2025-10";
 
+const CLAVIS_MODEL = process.env.CLAVIS_MODEL || "gpt-5.5";
+
 let cachedShopifyToken = null;
 let cachedShopifyTokenExpiresAt = 0;
 
@@ -72,6 +74,7 @@ function verifySessionToken(token) {
     if (!payloadBase64 || !signature) return false;
 
     const expectedSignature = signToken(payloadBase64);
+
     if (signature !== expectedSignature) return false;
 
     const payload = JSON.parse(Buffer.from(payloadBase64, "base64url").toString("utf8"));
@@ -184,6 +187,18 @@ function makeAdminSearchUrl(title) {
 
 function makeShopUrl(handle) {
   return `${SHOP_DOMAIN}/products/${handle || ""}`;
+}
+
+function productHasTag(product, tag) {
+  const wanted = String(tag || "").toLowerCase().trim();
+
+  return (product.tags || []).some((t) => {
+    return String(t || "").toLowerCase().trim() === wanted;
+  });
+}
+
+function productHasAnyTag(product, tags = []) {
+  return tags.some((tag) => productHasTag(product, tag));
 }
 
 /* -------------------------------
@@ -853,10 +868,121 @@ function buildOperationSections(report) {
 }
 
 /* -------------------------------
-   CLAVIS ÜRÜN EŞLEŞTİRME
+   CLAVIS AKILLI DANIŞMAN MOTORU
 -------------------------------- */
 
-async function matchProductsFromShopify(answerText) {
+async function createAdviceStrategy(answerText) {
+  const prompt = `
+Sen Expo Pharma'nın eczacı destekli ürün danışmanlığı motorusun.
+
+Görevin:
+Kullanıcının verdiği cevapları anlayıp ürün önerisi için strateji çıkarmak.
+
+Çok önemli:
+- Tanı koyma.
+- Tedavi iddiası oluşturma.
+- Ürün seçimini mekanik etiket eşleşmesi gibi yapma.
+- Önce ihtiyacı eczacı mantığıyla yorumla.
+- Ürün rutini mantığı kur.
+- Sadece JSON döndür.
+
+Kategori etiketleri:
+cat_dermokozmetik
+cat_vitamin_takviye
+cat_anne_bebek
+cat_medikal
+cat_saglik_yasam
+cat_kisisel_bakim
+
+Dermokozmetik ihtiyaç etiketleri:
+need_akne
+need_leke
+need_nem
+need_hassas_cilt
+need_gunes_koruma
+
+Cilt tipi etiketleri:
+skin_yagli
+skin_kuru
+skin_karma
+skin_hassas
+
+Alt kategori/form etiketleri:
+sub_cilt_temizleyici
+sub_gunes_koruyucu
+sub_omega3
+sub_kolajen
+sub_magnezyum
+sub_probiyotik
+sub_tansiyon
+sub_seker_olcum
+form_gel
+form_krem
+form_serum
+
+Kullanıcı cevapları:
+${answerText}
+
+JSON formatı:
+{
+  "mainCategory": "cat_dermokozmetik",
+  "problemSummary": "Kısa ihtiyaç özeti",
+  "detectedNeeds": ["need_akne"],
+  "detectedSkinTypes": ["skin_yagli"],
+  "preferredTags": ["cat_dermokozmetik", "need_akne", "skin_yagli", "sub_cilt_temizleyici"],
+  "avoidTags": ["need_hassas_cilt"],
+  "routineSlots": [
+    {
+      "slot": "cleanser",
+      "title": "Temizleyici",
+      "priority": 1,
+      "desiredTags": ["sub_cilt_temizleyici", "form_gel", "skin_yagli"]
+    },
+    {
+      "slot": "active_care",
+      "title": "Aktif bakım",
+      "priority": 2,
+      "desiredTags": ["need_akne"]
+    },
+    {
+      "slot": "support",
+      "title": "Destek ürün",
+      "priority": 3,
+      "desiredTags": ["need_nem", "skin_yagli"]
+    }
+  ],
+  "searchKeywords": ["akne", "sivilce", "siyah nokta", "yağlı cilt"],
+  "redFlags": [],
+  "adviceTone": "Profesyonel, doğal, eczacı dili"
+}
+`;
+
+  const response = await client.responses.create({
+    model: CLAVIS_MODEL,
+    input: prompt
+  });
+
+  const parsed = safeJsonParse(response.output_text);
+
+  if (!parsed || !parsed.mainCategory) {
+    return {
+      mainCategory: "cat_dermokozmetik",
+      problemSummary: "Kullanıcının ihtiyacına göre genel ürün danışmanlığı.",
+      detectedNeeds: [],
+      detectedSkinTypes: [],
+      preferredTags: [],
+      avoidTags: [],
+      routineSlots: [],
+      searchKeywords: [],
+      redFlags: [],
+      adviceTone: "Profesyonel, doğal, eczacı dili"
+    };
+  }
+
+  return parsed;
+}
+
+async function getCandidateProductsByStrategy(strategy) {
   let products = [];
 
   try {
@@ -865,153 +991,15 @@ async function matchProductsFromShopify(answerText) {
     products = await fetchShopifyPublicProducts();
   }
 
-  const normalizedAnswer = normalizeText(answerText);
+  const preferredTags = Array.isArray(strategy.preferredTags) ? strategy.preferredTags : [];
+  const avoidTags = Array.isArray(strategy.avoidTags) ? strategy.avoidTags : [];
+  const searchKeywords = Array.isArray(strategy.searchKeywords) ? strategy.searchKeywords : [];
+  const mainCategory = strategy.mainCategory || "";
 
-  function hasAny(words) {
-    return words.some((word) => normalizedAnswer.includes(normalizeText(word)));
-  }
-
-  function productHasTag(product, tag) {
-    const wanted = String(tag || "").toLowerCase().trim();
-
-    return (product.tags || []).some((t) => {
-      return String(t || "").toLowerCase().trim() === wanted;
-    });
-  }
-
-  function productHasAnyTag(product, tags) {
-    return tags.some((tag) => productHasTag(product, tag));
-  }
-
-  function detectIntent() {
-    const intent = {
-      categories: [],
-      needs: [],
-      subs: [],
-      skin: [],
-      forms: []
-    };
-
-    if (
-      hasAny([
-        "sivilce", "akne", "komedon", "siyah nokta", "gözenek", "gozenek",
-        "leke", "kızarıklık", "kizariklik", "cilt", "yüz", "yuz",
-        "nem", "kuruluk", "hassas", "spf", "güneş", "gunes",
-        "serum", "krem", "temizleyici", "tonik", "bariyer"
-      ])
-    ) {
-      intent.categories.push("cat_dermokozmetik");
-    }
-
-    if (hasAny(["sivilce", "akne", "komedon", "siyah nokta", "gözenek", "gozenek"])) {
-      intent.needs.push("need_akne");
-      intent.skin.push("skin_yagli", "skin_karma");
-    }
-
-    if (hasAny(["leke", "lekelenme", "pigment", "koyu leke"])) {
-      intent.needs.push("need_leke");
-    }
-
-    if (hasAny(["güneş", "gunes", "spf", "koruyucu", "güneş kremi", "gunes kremi"])) {
-      intent.needs.push("need_gunes_koruma");
-      intent.subs.push("sub_gunes_koruyucu");
-    }
-
-    if (hasAny(["kuru", "kuruluk", "nem", "nemlendirici", "bariyer"])) {
-      intent.needs.push("need_nem");
-      intent.skin.push("skin_kuru");
-    }
-
-    if (hasAny(["hassas", "kızarıklık", "kizariklik", "yanma", "tahriş", "tahris"])) {
-      intent.needs.push("need_hassas_cilt");
-      intent.skin.push("skin_hassas");
-    }
-
-    if (hasAny(["temizleyici", "temizleme", "yıkama", "yikama", "jel", "foam", "foaming"])) {
-      intent.subs.push("sub_cilt_temizleyici");
-      intent.forms.push("form_gel");
-    }
-
-    if (hasAny(["serum"])) {
-      intent.forms.push("form_serum");
-    }
-
-    if (hasAny(["krem"])) {
-      intent.forms.push("form_krem");
-    }
-
-    if (
-      hasAny([
-        "bebek", "çocuk", "cocuk", "pişik", "pisik", "emzik",
-        "biberon", "mama", "anne", "emzirme", "süt", "sut"
-      ])
-    ) {
-      intent.categories.push("cat_anne_bebek");
-    }
-
-    if (hasAny(["pişik", "pisik"])) {
-      intent.needs.push("need_pisik");
-    }
-
-    if (
-      hasAny([
-        "vitamin", "takviye", "omega", "kolajen", "collagen",
-        "magnezyum", "magnesium", "probiyotik", "probiotic",
-        "çinko", "cinko", "d vitamini", "b12", "demir",
-        "multivitamin", "bağışıklık", "bagisiklik"
-      ])
-    ) {
-      intent.categories.push("cat_vitamin_takviye");
-    }
-
-    if (hasAny(["omega", "balık yağı", "balik yagi", "krill"])) {
-      intent.subs.push("sub_omega3");
-    }
-
-    if (hasAny(["kolajen", "collagen"])) {
-      intent.subs.push("sub_kolajen");
-    }
-
-    if (hasAny(["magnezyum", "magnesium"])) {
-      intent.subs.push("sub_magnezyum");
-    }
-
-    if (hasAny(["probiyotik", "probiotic", "sindirim"])) {
-      intent.subs.push("sub_probiyotik");
-    }
-
-    if (
-      hasAny([
-        "tansiyon", "şeker ölçüm", "seker olcum", "glukometre",
-        "ateş ölçer", "ates olcer", "nebülizatör", "nebulizator",
-        "oksimetre", "medikal cihaz", "strip"
-      ])
-    ) {
-      intent.categories.push("cat_medikal");
-    }
-
-    if (hasAny(["tansiyon"])) {
-      intent.subs.push("sub_tansiyon");
-    }
-
-    if (hasAny(["şeker", "seker", "glukometre", "strip"])) {
-      intent.subs.push("sub_seker_olcum");
-    }
-
-    return intent;
-  }
-
-  const intent = detectIntent();
-
-  const categoryTags = [...new Set(intent.categories)];
-  const detailTags = [
-    ...new Set([
-      ...intent.needs,
-      ...intent.subs,
-      ...intent.skin,
-      ...intent.forms
-    ])
-  ];
+  const routineSlots = Array.isArray(strategy.routineSlots) ? strategy.routineSlots : [];
+  const routineTags = routineSlots.flatMap((slot) =>
+    Array.isArray(slot.desiredTags) ? slot.desiredTags : []
+  );
 
   const scored = products.map((product) => {
     const searchText = normalizeText(`
@@ -1023,92 +1011,42 @@ async function matchProductsFromShopify(answerText) {
 
     let score = 0;
 
-    if (categoryTags.length > 0) {
-      if (productHasAnyTag(product, categoryTags)) {
-        score += 50;
+    if (mainCategory) {
+      if (productHasTag(product, mainCategory)) {
+        score += 90;
       } else {
-        score -= 100;
+        score -= 140;
       }
     }
 
-    detailTags.forEach((tag) => {
+    preferredTags.forEach((tag) => {
       if (productHasTag(product, tag)) {
-        score += 18;
+        score += 20;
       }
     });
 
-    const isAcneIntent =
-      intent.needs.includes("need_akne") ||
-      normalizedAnswer.includes("sivilce") ||
-      normalizedAnswer.includes("akne") ||
-      normalizedAnswer.includes("siyah nokta") ||
-      normalizedAnswer.includes("komedon") ||
-      normalizedAnswer.includes("gozenek");
+    routineTags.forEach((tag) => {
+      if (productHasTag(product, tag)) {
+        score += 14;
+      }
+    });
 
-    if (isAcneIntent) {
-      if (productHasTag(product, "need_akne")) score += 35;
-      if (productHasTag(product, "sub_cilt_temizleyici")) score += 25;
-      if (productHasTag(product, "skin_yagli")) score += 20;
-      if (productHasTag(product, "skin_karma")) score += 15;
-      if (productHasTag(product, "form_gel")) score += 12;
-
-      if (
-        productHasTag(product, "need_nem") &&
-        !productHasTag(product, "need_akne") &&
-        !productHasTag(product, "sub_cilt_temizleyici")
-      ) {
+    avoidTags.forEach((tag) => {
+      if (productHasTag(product, tag)) {
         score -= 25;
       }
+    });
 
-      if (
-        productHasTag(product, "need_hassas_cilt") &&
-        !productHasTag(product, "need_akne")
-      ) {
-        score -= 18;
-      }
-
-      if (searchText.includes("hydra") && !searchText.includes("kerato")) {
-        score -= 18;
-      }
-
-      if (searchText.includes("toleriane")) {
-        score -= 22;
-      }
-
-      if (searchText.includes("effaclar") && searchText.includes("mat")) {
-        score += 10;
-      }
-
-      if (searchText.includes("kerato")) {
-        score += 18;
-      }
-
-      if (
-        searchText.includes("temizleyici") ||
-        searchText.includes("foaming") ||
-        searchText.includes("gel") ||
-        searchText.includes("cleanser")
-      ) {
-        score += 18;
-      }
-    }
-
-    const softKeywords = [
-      "sivilce", "akne", "leke", "güneş", "gunes", "spf",
-      "nem", "hassas", "bebek", "pişik", "pisik",
-      "omega", "kolajen", "magnezyum", "tansiyon"
-    ];
-
-    softKeywords.forEach((keyword) => {
+    searchKeywords.forEach((keyword) => {
       const k = normalizeText(keyword);
-      if (normalizedAnswer.includes(k) && searchText.includes(k)) {
-        score += 4;
+      if (k && searchText.includes(k)) {
+        score += 10;
       }
     });
 
-    if (product.available) score += 3;
-    if (product.price > 0) score += 2;
-    if (product.image) score += 1;
+    if (product.available) score += 5;
+    if (product.price > 0) score += 4;
+    if (product.image) score += 2;
 
     return {
       ...product,
@@ -1119,7 +1057,96 @@ async function matchProductsFromShopify(answerText) {
   return scored
     .filter((p) => p.score > 0)
     .sort((a, b) => b.score - a.score)
+    .slice(0, 40);
+}
+
+async function rankProductsWithAI(strategy, candidateProducts) {
+  if (!candidateProducts.length) return [];
+
+  const compactProducts = candidateProducts.map((p, index) => ({
+    index,
+    id: p.id,
+    title: p.title,
+    vendor: p.vendor,
+    product_type: p.product_type,
+    tags: p.tags,
+    price: p.price,
+    available: p.available,
+    url: p.url,
+    image: p.image
+  }));
+
+  const prompt = `
+Sen Expo Pharma'nın eczacı destekli ürün seçim danışmanısın.
+
+Görevin:
+Verilen stratejiye göre aday ürünler arasından en mantıklı ürünleri seçmek ve sıraya koymak.
+
+Çok önemli:
+- Sadece verilen aday ürünlerden seçim yap.
+- Ürün uydurma.
+- Tanı koyma.
+- Tedavi eder gibi kesin iddia kurma.
+- Ürünleri bakım/ürün rutini mantığıyla sırala.
+- Aynı role sahip gereksiz benzer ürünleri seçme.
+- En fazla 4 ürün seç.
+- Ürün yoksa boş liste döndür.
+- Seçtiğin ürünlerin rolleri birbirini tamamlamalı.
+
+Strateji:
+${JSON.stringify(strategy, null, 2)}
+
+Aday ürünler:
+${JSON.stringify(compactProducts, null, 2)}
+
+JSON formatı:
+{
+  "selected": [
+    {
+      "index": 0,
+      "role": "Temizleyici",
+      "reason": "Yağlı ve akneye eğilimli ciltlerde ilk adım olarak değerlendirilebilir."
+    }
+  ]
+}
+`;
+
+  const response = await client.responses.create({
+    model: CLAVIS_MODEL,
+    input: prompt
+  });
+
+  const parsed = safeJsonParse(response.output_text);
+
+  if (!parsed || !Array.isArray(parsed.selected)) {
+    return [];
+  }
+
+  return parsed.selected
+    .map((selected) => {
+      const product = candidateProducts[selected.index];
+
+      if (!product) return null;
+
+      return {
+        ...product,
+        clavisRole: selected.role || "Ürün önerisi",
+        clavisReason: selected.reason || "Verdiğiniz bilgilere göre değerlendirilebilir."
+      };
+    })
+    .filter(Boolean)
     .slice(0, 4);
+}
+
+async function matchProductsFromShopify(answerText) {
+  const strategy = await createAdviceStrategy(answerText);
+  const candidates = await getCandidateProductsByStrategy(strategy);
+  const selectedProducts = await rankProductsWithAI(strategy, candidates);
+
+  return {
+    strategy,
+    products: selectedProducts
+  };
 }
 
 /* -------------------------------
@@ -1472,12 +1499,13 @@ app.post("/api/clavis-analyze", async (req, res) => {
 Sen Expo Pharma'nın CLAVIS AI eczacı destek asistanısın.
 
 Görevin:
-Kullanıcının ihtiyacını anlamak için kısa ve hedefli sorular sormak.
+Kullanıcının ihtiyacını anlamak için doğal, kısa ve hedefli sorular sormak.
 
 Kurallar:
 - Tanı koyma.
 - Tedavi iddiası yazma.
 - Ürün satmaya acele etme.
+- Bot gibi form soruları sorma.
 - Kullanıcıya eczacı ilgisi hissettir.
 - Maksimum 4 soru sor.
 - Sorular kısa, anlaşılır ve cevaplanabilir olsun.
@@ -1490,7 +1518,7 @@ ${message}
 
 JSON formatı:
 {
-  "intro": "Kısa güven veren bir cümle",
+  "intro": "Kısa, doğal ve güven veren bir cümle",
   "questions": [
     "1. soru",
     "2. soru",
@@ -1502,7 +1530,7 @@ JSON formatı:
 `;
 
       const response = await client.responses.create({
-        model: "gpt-4o-mini",
+        model: CLAVIS_MODEL,
         input: triagePrompt
       });
 
@@ -1511,12 +1539,12 @@ JSON formatı:
       if (!parsed || !Array.isArray(parsed.questions)) {
         return res.json({
           intro:
-            "Doğru yönlendirme yapabilmem için birkaç kısa bilgiye ihtiyacım var.",
+            "Daha doğru yönlendirme yapabilmem için birkaç kısa bilgiyi netleştirelim.",
           questions: [
             "Şikâyetiniz ne kadar süredir var?",
             "Hangi bölgede daha yoğun?",
-            "Kızarık, iltihaplı veya ağrılı mı?",
-            "Cildiniz yağlı, kuru, karma veya hassas mı?"
+            "Sivilceler iltihaplı mı, yoksa daha çok siyah nokta/kapalı komedon şeklinde mi?",
+            "Cildiniz ürünlerden sonra kolay kızarır veya yanma yapar mı?"
           ],
           needImage: true
         });
@@ -1531,14 +1559,17 @@ JSON formatı:
       }
 
       const answerText = JSON.stringify(answers);
-      const matchedProducts = await matchProductsFromShopify(answerText);
+
+      const matchResult = await matchProductsFromShopify(answerText);
+      const adviceStrategy = matchResult.strategy;
+      const matchedProducts = matchResult.products;
 
       const productText =
         matchedProducts.length > 0
           ? matchedProducts
               .map(
                 (p) =>
-                  `- ${p.title} | Fiyat: ${p.price} TL | Link: ${p.url} | Kategori: ${p.product_type || "Belirtilmemiş"}`
+                  `- ${p.title} | Rol: ${p.clavisRole || "Ürün önerisi"} | Neden: ${p.clavisReason || ""} | Fiyat: ${p.price} TL | Link: ${p.url} | Kategori: ${p.product_type || "Belirtilmemiş"}`
               )
               .join("\n")
           : "Uygun ürün eşleşmesi bulunamadı.";
@@ -1550,16 +1581,18 @@ JSON formatı:
 Sen Expo Pharma'nın CLAVIS AI eczacı destek asistanısın.
 
 Görevin:
-Kullanıcının verdiği cevaplara göre genel ürün danışmanlığı yapmak.
+Kullanıcının verdiği cevaplara göre doğal, profesyonel ve eczacı mantığıyla ürün danışmanlığı yapmak.
 
 Çok önemli kurallar:
 - Tanı koyma.
 - "Tedavi eder", "kesin geçirir", "hastalığı iyileştirir" gibi kesin ifadeler kullanma.
 - "Uygun olabilir", "destekleyebilir", "değerlendirilebilir" gibi güvenli dil kullan.
-- Direkt ürün satmaya çalışma; önce kısa değerlendirme yap.
-- Uygun değilse ürün önermemeyi bil.
+- Bot gibi yazma.
+- Mekanik listeleme yapma.
+- Ürünleri bakım rutini/öncelik mantığıyla açıkla.
+- Ürün uygun değilse önermemeyi bil.
 - Kırmızı bayrak varsa doktora/dermatoloğa yönlendir.
-- Ürün önerirken sadece aşağıdaki ürün havuzundan öner.
+- Ürün önerirken sadece aşağıdaki seçilen ürün havuzundan öner.
 - En fazla 4 ürün öner.
 - Cevap Türkçe olsun.
 - Kısa ama güven veren profesyonel tonda yaz.
@@ -1567,14 +1600,17 @@ Kullanıcının verdiği cevaplara göre genel ürün danışmanlığı yapmak.
 Kullanıcı cevapları:
 ${answerText}
 
-Siteden eşleşen ürünler:
+Clavis ürün stratejisi:
+${JSON.stringify(adviceStrategy, null, 2)}
+
+Siteden seçilen ürünler:
 ${productText}
 
 Cevabı şu başlıklarla yaz:
 
 1. Kısa Değerlendirme
 2. Sizin İçin Netleştirdiğim Noktalar
-3. Genel Bakım Yaklaşımı
+3. Ürün Seçim Mantığı
 4. Expo Pharma Ürün Önerisi
 5. Ne Zaman Uzman Görüşü Alınmalı
 6. Eczacı Notu
@@ -1590,7 +1626,7 @@ Cevabı şu başlıklarla yaz:
       }
 
       const response = await client.responses.create({
-        model: "gpt-4o-mini",
+        model: CLAVIS_MODEL,
         input: [
           {
             role: "user",
@@ -1610,7 +1646,8 @@ Cevabı şu başlıklarla yaz:
           price: p.price,
           compareAtPrice: p.compareAtPrice,
           available: p.available,
-          reason: "Verdiğiniz bilgilere göre bu ürün/kategori değerlendirilebilir."
+          role: p.clavisRole || "Ürün önerisi",
+          reason: p.clavisReason || "Verdiğiniz bilgilere göre bu ürün değerlendirilebilir."
         })),
         disclaimer:
           "Bu hizmet genel ürün danışmanlığı sağlar. Tanı ve tedavi yerine geçmez."
