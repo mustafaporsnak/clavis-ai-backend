@@ -72,7 +72,6 @@ function verifySessionToken(token) {
     if (!payloadBase64 || !signature) return false;
 
     const expectedSignature = signToken(payloadBase64);
-
     if (signature !== expectedSignature) return false;
 
     const payload = JSON.parse(Buffer.from(payloadBase64, "base64url").toString("utf8"));
@@ -895,7 +894,7 @@ async function matchProductsFromShopify(answerText) {
 
     if (
       hasAny([
-        "sivilce", "akne", "komedon", "gözenek", "gozenek",
+        "sivilce", "akne", "komedon", "siyah nokta", "gözenek", "gozenek",
         "leke", "kızarıklık", "kizariklik", "cilt", "yüz", "yuz",
         "nem", "kuruluk", "hassas", "spf", "güneş", "gunes",
         "serum", "krem", "temizleyici", "tonik", "bariyer"
@@ -904,7 +903,7 @@ async function matchProductsFromShopify(answerText) {
       intent.categories.push("cat_dermokozmetik");
     }
 
-    if (hasAny(["sivilce", "akne", "komedon", "gözenek", "gozenek"])) {
+    if (hasAny(["sivilce", "akne", "komedon", "siyah nokta", "gözenek", "gozenek"])) {
       intent.needs.push("need_akne");
       intent.skin.push("skin_yagli", "skin_karma");
     }
@@ -928,7 +927,7 @@ async function matchProductsFromShopify(answerText) {
       intent.skin.push("skin_hassas");
     }
 
-    if (hasAny(["temizleyici", "yıkama", "yikama", "jel"])) {
+    if (hasAny(["temizleyici", "temizleme", "yıkama", "yikama", "jel", "foam", "foaming"])) {
       intent.subs.push("sub_cilt_temizleyici");
       intent.forms.push("form_gel");
     }
@@ -1037,6 +1036,62 @@ async function matchProductsFromShopify(answerText) {
         score += 18;
       }
     });
+
+    const isAcneIntent =
+      intent.needs.includes("need_akne") ||
+      normalizedAnswer.includes("sivilce") ||
+      normalizedAnswer.includes("akne") ||
+      normalizedAnswer.includes("siyah nokta") ||
+      normalizedAnswer.includes("komedon") ||
+      normalizedAnswer.includes("gozenek");
+
+    if (isAcneIntent) {
+      if (productHasTag(product, "need_akne")) score += 35;
+      if (productHasTag(product, "sub_cilt_temizleyici")) score += 25;
+      if (productHasTag(product, "skin_yagli")) score += 20;
+      if (productHasTag(product, "skin_karma")) score += 15;
+      if (productHasTag(product, "form_gel")) score += 12;
+
+      if (
+        productHasTag(product, "need_nem") &&
+        !productHasTag(product, "need_akne") &&
+        !productHasTag(product, "sub_cilt_temizleyici")
+      ) {
+        score -= 25;
+      }
+
+      if (
+        productHasTag(product, "need_hassas_cilt") &&
+        !productHasTag(product, "need_akne")
+      ) {
+        score -= 18;
+      }
+
+      if (searchText.includes("hydra") && !searchText.includes("kerato")) {
+        score -= 18;
+      }
+
+      if (searchText.includes("toleriane")) {
+        score -= 22;
+      }
+
+      if (searchText.includes("effaclar") && searchText.includes("mat")) {
+        score += 10;
+      }
+
+      if (searchText.includes("kerato")) {
+        score += 18;
+      }
+
+      if (
+        searchText.includes("temizleyici") ||
+        searchText.includes("foaming") ||
+        searchText.includes("gel") ||
+        searchText.includes("cleanser")
+      ) {
+        score += 18;
+      }
+    }
 
     const softKeywords = [
       "sivilce", "akne", "leke", "güneş", "gunes", "spf",
