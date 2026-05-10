@@ -16,10 +16,6 @@ const client = new OpenAI({
 app.use(cors());
 app.use(express.json({ limit: "20mb" }));
 
-/* -------------------------------
-   SABİTLER
--------------------------------- */
-
 const SHOP_DOMAIN = "https://www.expo-pharma.com";
 
 const CLAVIS_ADMIN_PASSWORD = process.env.CLAVIS_ADMIN_PASSWORD;
@@ -37,7 +33,7 @@ let cachedShopifyToken = null;
 let cachedShopifyTokenExpiresAt = 0;
 
 /* -------------------------------
-   ADMIN OTURUM SİSTEMİ
+   ADMIN OTURUM
 -------------------------------- */
 
 function getSessionSecret() {
@@ -70,15 +66,12 @@ function createSessionToken() {
 function verifySessionToken(token) {
   try {
     const [payloadBase64, signature] = String(token || "").split(".");
-
     if (!payloadBase64 || !signature) return false;
 
     const expectedSignature = signToken(payloadBase64);
-
     if (signature !== expectedSignature) return false;
 
     const payload = JSON.parse(Buffer.from(payloadBase64, "base64url").toString("utf8"));
-
     if (!payload.exp || Date.now() > payload.exp) return false;
 
     return true;
@@ -197,12 +190,8 @@ function productHasTag(product, tag) {
   });
 }
 
-function productHasAnyTag(product, tags = []) {
-  return tags.some((tag) => productHasTag(product, tag));
-}
-
 /* -------------------------------
-   SHOPIFY ADMIN API
+   SHOPIFY API
 -------------------------------- */
 
 async function getShopifyAccessToken() {
@@ -307,6 +296,10 @@ async function shopifyRest(path, options = {}) {
   return data;
 }
 
+/* -------------------------------
+   SHOPIFY ÜRÜN OKUMA
+-------------------------------- */
+
 async function fetchShopifyAdminProducts() {
   const allProducts = [];
   let hasNextPage = true;
@@ -342,6 +335,7 @@ async function fetchShopifyAdminProducts() {
                     barcode
                     price
                     compareAtPrice
+                    inventoryQuantity
                     inventoryItem {
                       id
                       tracked
@@ -350,7 +344,6 @@ async function fetchShopifyAdminProducts() {
                         currencyCode
                       }
                     }
-                    inventoryQuantity
                   }
                 }
               }
@@ -377,7 +370,6 @@ async function fetchShopifyAdminProducts() {
       : [];
 
     const firstVariant = variants[0] || {};
-
     const price = toNumber(firstVariant.price);
     const compareAtPrice = toNumber(firstVariant.compareAtPrice);
 
@@ -392,7 +384,9 @@ async function fetchShopifyAdminProducts() {
       url: makeShopUrl(p.handle),
       adminSearchUrl: makeAdminSearchUrl(p.title),
       image: p.featuredImage?.url || "",
-      available: Number(firstVariant.inventoryQuantity || 0) > 0,
+      available:
+        String(p.status || "").toUpperCase() === "ACTIVE" &&
+        Number(firstVariant.inventoryQuantity || 0) > 0,
       price,
       compareAtPrice,
       variants: variants.map((v) => ({
@@ -410,10 +404,6 @@ async function fetchShopifyAdminProducts() {
     };
   });
 }
-
-/* -------------------------------
-   PUBLIC SHOPIFY FALLBACK
--------------------------------- */
 
 async function fetchShopifyPublicProducts() {
   const allProducts = [];
@@ -438,14 +428,12 @@ async function fetchShopifyPublicProducts() {
     if (products.length < limit) break;
 
     page++;
-
     if (page > 30) break;
   }
 
   return allProducts.map((p) => {
     const variants = Array.isArray(p.variants) ? p.variants : [];
     const firstVariant = variants[0] || {};
-
     const price = toNumber(firstVariant.price);
     const compareAtPrice = toNumber(firstVariant.compare_at_price);
 
@@ -484,7 +472,7 @@ async function fetchShopifyPublicProducts() {
 }
 
 /* -------------------------------
-   GOOGLE SHEET MALİYET TABLOSU
+   GOOGLE SHEET MALİYET / PSF
 -------------------------------- */
 
 async function fetchCostSheet() {
@@ -514,7 +502,7 @@ async function fetchCostSheet() {
       ])
     );
 
-    const psf = toNumber(getField(item, ["PSF", "psf"]));
+    const psf = toNumber(getField(item, ["PSF", "psf", "Psf"]));
 
     const recommendedPrice = toNumber(
       getField(item, [
@@ -566,7 +554,7 @@ async function fetchCostSheet() {
 }
 
 /* -------------------------------
-   EŞLEŞTİRME VE HESAPLAMA
+   EŞLEŞTİRME / HESAP
 -------------------------------- */
 
 function matchCostData(product, costItems) {
@@ -611,12 +599,9 @@ function matchCostData(product, costItems) {
 
   match = costItems.find((item) => {
     const itemName = normalizeText(item.productName);
-
     if (!itemName || !productTitle) return false;
-
     if (itemName.length > 8 && productTitle.includes(itemName)) return true;
     if (productTitle.length > 8 && itemName.includes(productTitle)) return true;
-
     return false;
   });
 
@@ -659,19 +644,25 @@ function productToOperationRow(product, cost = null, profit = null) {
   const barcode = firstVariant.barcode || cost?.barcode || "";
   const sku = firstVariant.sku || cost?.sku || "";
 
-  const psf = Number(cost?.psf || 0);
+  const psf =
+    Number(cost?.psf || 0) ||
+    Number(product.compareAtPrice || 0) ||
+    Number(firstVariant.compareAtPrice || 0);
+
   const recommendedPrice =
     Number(cost?.recommendedPrice || 0) ||
     (psf > 0 ? roundMoney(psf * 0.95) : 0);
 
   return {
     id: product.id,
+    productId: product.id,
     variantId: firstVariant.id || "",
     inventoryItemId: firstVariant.inventoryItemId || "",
     title: product.title,
     vendor: product.vendor,
     handle: product.handle,
     status: product.status,
+    isActive: String(product.status || "").toUpperCase() === "ACTIVE",
     barcode,
     sku,
     shopifyPrice: Number(product.price || 0),
@@ -692,7 +683,7 @@ function productToOperationRow(product, cost = null, profit = null) {
 }
 
 /* -------------------------------
-   DENETİM RAPORU
+   DENETİM
 -------------------------------- */
 
 function auditProducts(products, costItems, options = {}) {
@@ -758,14 +749,15 @@ function auditProducts(products, costItems, options = {}) {
 
     if (!cost) {
       missingCost.push(row);
+      if (!row.psf || row.psf <= 0) missingPsf.push(row);
       return;
     }
 
-    if (!cost.psf || cost.psf <= 0) missingPsf.push(row);
+    if (!row.psf || row.psf <= 0) missingPsf.push(row);
 
-    if (cost.psf > 0 && product.price > cost.psf) psfAbove.push(row);
+    if (row.psf > 0 && product.price > row.psf) psfAbove.push(row);
 
-    if (cost.psf > 0 && product.price > 0 && product.price < cost.psf) {
+    if (row.psf > 0 && product.price > 0 && product.price < row.psf) {
       psfBelow.push(row);
     }
 
@@ -868,7 +860,7 @@ function buildOperationSections(report) {
 }
 
 /* -------------------------------
-   CLAVIS AKILLI DANIŞMAN MOTORU
+   CLAVIS AI MOTOR
 -------------------------------- */
 
 async function createAdviceStrategy(answerText) {
@@ -937,18 +929,6 @@ JSON formatı:
       "title": "Temizleyici",
       "priority": 1,
       "desiredTags": ["sub_cilt_temizleyici", "form_gel", "skin_yagli"]
-    },
-    {
-      "slot": "active_care",
-      "title": "Aktif bakım",
-      "priority": 2,
-      "desiredTags": ["need_akne"]
-    },
-    {
-      "slot": "support",
-      "title": "Destek ürün",
-      "priority": 3,
-      "desiredTags": ["need_nem", "skin_yagli"]
     }
   ],
   "searchKeywords": ["akne", "sivilce", "siyah nokta", "yağlı cilt"],
@@ -1012,46 +992,32 @@ async function getCandidateProductsByStrategy(strategy) {
     let score = 0;
 
     if (mainCategory) {
-      if (productHasTag(product, mainCategory)) {
-        score += 90;
-      } else {
-        score -= 140;
-      }
+      if (productHasTag(product, mainCategory)) score += 90;
+      else score -= 140;
     }
 
     preferredTags.forEach((tag) => {
-      if (productHasTag(product, tag)) {
-        score += 20;
-      }
+      if (productHasTag(product, tag)) score += 20;
     });
 
     routineTags.forEach((tag) => {
-      if (productHasTag(product, tag)) {
-        score += 14;
-      }
+      if (productHasTag(product, tag)) score += 14;
     });
 
     avoidTags.forEach((tag) => {
-      if (productHasTag(product, tag)) {
-        score -= 25;
-      }
+      if (productHasTag(product, tag)) score -= 25;
     });
 
     searchKeywords.forEach((keyword) => {
       const k = normalizeText(keyword);
-      if (k && searchText.includes(k)) {
-        score += 10;
-      }
+      if (k && searchText.includes(k)) score += 10;
     });
 
     if (product.available) score += 5;
     if (product.price > 0) score += 4;
     if (product.image) score += 2;
 
-    return {
-      ...product,
-      score
-    };
+    return { ...product, score };
   });
 
   return scored
@@ -1091,7 +1057,6 @@ Verilen stratejiye göre aday ürünler arasından en mantıklı ürünleri seç
 - Aynı role sahip gereksiz benzer ürünleri seçme.
 - En fazla 4 ürün seç.
 - Ürün yoksa boş liste döndür.
-- Seçtiğin ürünlerin rolleri birbirini tamamlamalı.
 
 Strateji:
 ${JSON.stringify(strategy, null, 2)}
@@ -1125,7 +1090,6 @@ JSON formatı:
   return parsed.selected
     .map((selected) => {
       const product = candidateProducts[selected.index];
-
       if (!product) return null;
 
       return {
@@ -1160,10 +1124,15 @@ app.get("/", (req, res) => {
     adminLogin: "/api/admin-login",
     adminSession: "/api/admin-session",
     shopifyAdminTest: "/api/shopify-admin-test",
+    shopifyProducts: "/api/shopify-products",
+    adminProductsFull: "/api/admin-products-full",
     productOperations: "/api/product-operations",
     priceAudit: "/api/price-audit",
     costSheet: "/api/cost-sheet",
-    updateVariant: "/api/update-variant-basic"
+    updateVariant: "/api/update-variant-basic",
+    updateInventoryItem: "/api/update-inventory-item",
+    updateProductStatus: "/api/update-product-status",
+    bulkProductAction: "/api/bulk-product-action"
   });
 });
 
@@ -1172,7 +1141,7 @@ app.get("/health", (req, res) => {
 });
 
 /* -------------------------------
-   ADMIN LOGIN ENDPOINTLERİ
+   ADMIN LOGIN
 -------------------------------- */
 
 app.post("/api/admin-login", (req, res) => {
@@ -1198,13 +1167,11 @@ app.post("/api/admin-login", (req, res) => {
 });
 
 app.get("/api/admin-session", checkAdminPassword, (req, res) => {
-  return res.json({
-    status: "ok"
-  });
+  return res.json({ status: "ok" });
 });
 
 /* -------------------------------
-   ADMIN ENDPOINTLERİ
+   ADMIN OKUMA ENDPOINTLERİ
 -------------------------------- */
 
 app.get("/api/shopify-admin-test", checkAdminPassword, async (req, res) => {
@@ -1221,6 +1188,7 @@ app.get("/api/shopify-admin-test", checkAdminPassword, async (req, res) => {
               id
               title
               handle
+              status
               variants(first: 1) {
                 edges {
                   node {
@@ -1298,6 +1266,38 @@ app.get("/api/shopify-products", checkAdminPassword, async (req, res) => {
   }
 });
 
+app.get("/api/admin-products-full", checkAdminPassword, async (req, res) => {
+  try {
+    let products = [];
+
+    try {
+      products = await fetchShopifyAdminProducts();
+    } catch (adminError) {
+      console.error("ADMIN SHOPIFY READ FAILED:", adminError);
+      products = await fetchShopifyPublicProducts();
+    }
+
+    const costItems = await fetchCostSheet();
+
+    const rows = products.map((product) => {
+      const cost = matchCostData(product, costItems);
+      const profit = cost ? calculateProfit(product, cost) : null;
+      return productToOperationRow(product, cost, profit);
+    });
+
+    return res.json({
+      status: "ok",
+      count: rows.length,
+      products: rows
+    });
+  } catch (error) {
+    console.error("ADMIN PRODUCTS FULL ERROR:", error);
+    return res.status(500).json({
+      error: "Ürün listesi alınamadı."
+    });
+  }
+});
+
 app.get("/api/price-audit", checkAdminPassword, async (req, res) => {
   try {
     const minSuspiciousPrice = req.query.minPrice || 10;
@@ -1361,17 +1361,13 @@ app.post("/api/update-variant-basic", checkAdminPassword, async (req, res) => {
     const { variantId, price, compareAtPrice, barcode, sku } = req.body || {};
 
     if (!variantId) {
-      return res.status(400).json({
-        error: "variantId eksik."
-      });
+      return res.status(400).json({ error: "variantId eksik." });
     }
 
     const numericVariantId = String(variantId).split("/").pop();
 
     if (!numericVariantId || Number.isNaN(Number(numericVariantId))) {
-      return res.status(400).json({
-        error: "variantId formatı hatalı."
-      });
+      return res.status(400).json({ error: "variantId formatı hatalı." });
     }
 
     const variant = {
@@ -1400,9 +1396,7 @@ app.post("/api/update-variant-basic", checkAdminPassword, async (req, res) => {
 
     const data = await shopifyRest(`/variants/${numericVariantId}.json`, {
       method: "PUT",
-      body: JSON.stringify({
-        variant
-      })
+      body: JSON.stringify({ variant })
     });
 
     return res.json({
@@ -1422,9 +1416,7 @@ app.post("/api/update-inventory-item", checkAdminPassword, async (req, res) => {
     const { inventoryItemId, tracked, cost } = req.body || {};
 
     if (!inventoryItemId) {
-      return res.status(400).json({
-        error: "inventoryItemId eksik."
-      });
+      return res.status(400).json({ error: "inventoryItemId eksik." });
     }
 
     const input = {};
@@ -1478,6 +1470,244 @@ app.post("/api/update-inventory-item", checkAdminPassword, async (req, res) => {
     console.error("UPDATE INVENTORY ITEM ERROR:", error);
     return res.status(500).json({
       error: error.message || "Inventory item güncellenemedi."
+    });
+  }
+});
+
+app.post("/api/update-product-status", checkAdminPassword, async (req, res) => {
+  try {
+    const { productId, status } = req.body || {};
+
+    if (!productId) {
+      return res.status(400).json({ error: "productId eksik." });
+    }
+
+    const cleanStatus = String(status || "").toUpperCase();
+    const allowedStatuses = ["ACTIVE", "DRAFT", "ARCHIVED"];
+
+    if (!allowedStatuses.includes(cleanStatus)) {
+      return res.status(400).json({
+        error: "status ACTIVE, DRAFT veya ARCHIVED olmalı."
+      });
+    }
+
+    const data = await shopifyGraphQL(
+      `
+      mutation productUpdate($input: ProductInput!) {
+        productUpdate(input: $input) {
+          product {
+            id
+            title
+            status
+          }
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+      `,
+      {
+        input: {
+          id: productId,
+          status: cleanStatus
+        }
+      }
+    );
+
+    const errors = data.productUpdate.userErrors || [];
+
+    if (errors.length) {
+      return res.status(400).json({
+        error: errors.map((e) => e.message).join(", ")
+      });
+    }
+
+    return res.json({
+      status: "ok",
+      product: data.productUpdate.product
+    });
+  } catch (error) {
+    console.error("UPDATE PRODUCT STATUS ERROR:", error);
+    return res.status(500).json({
+      error: error.message || "Ürün durumu güncellenemedi."
+    });
+  }
+});
+
+app.post("/api/bulk-product-action", checkAdminPassword, async (req, res) => {
+  try {
+    const {
+      items,
+      action,
+      price,
+      compareAtPrice,
+      cost,
+      status,
+      discountPercent
+    } = req.body || {};
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "Seçili ürün yok." });
+    }
+
+    const results = [];
+
+    for (const item of items) {
+      try {
+        if (action === "set_status") {
+          if (!item.productId) throw new Error("productId eksik.");
+
+          const cleanStatus = String(status || "ACTIVE").toUpperCase();
+
+          const data = await shopifyGraphQL(
+            `
+            mutation productUpdate($input: ProductInput!) {
+              productUpdate(input: $input) {
+                product {
+                  id
+                  status
+                }
+                userErrors {
+                  message
+                }
+              }
+            }
+            `,
+            {
+              input: {
+                id: item.productId,
+                status: cleanStatus
+              }
+            }
+          );
+
+          const errors = data.productUpdate.userErrors || [];
+          if (errors.length) throw new Error(errors.map((e) => e.message).join(", "));
+
+          results.push({
+            ok: true,
+            productId: item.productId,
+            action,
+            status: cleanStatus
+          });
+        }
+
+        if (action === "set_variant_price") {
+          if (!item.variantId) throw new Error("variantId eksik.");
+
+          const numericVariantId = String(item.variantId).split("/").pop();
+
+          const variant = {
+            id: Number(numericVariantId)
+          };
+
+          if (price !== undefined && price !== "") {
+            variant.price = String(roundMoney(toNumber(price)));
+          }
+
+          if (compareAtPrice !== undefined && compareAtPrice !== "") {
+            variant.compare_at_price = String(roundMoney(toNumber(compareAtPrice)));
+          }
+
+          await shopifyRest(`/variants/${numericVariantId}.json`, {
+            method: "PUT",
+            body: JSON.stringify({ variant })
+          });
+
+          results.push({
+            ok: true,
+            variantId: item.variantId,
+            action
+          });
+        }
+
+        if (action === "discount_from_psf") {
+          if (!item.variantId) throw new Error("variantId eksik.");
+          if (!item.psf || Number(item.psf) <= 0) throw new Error("PSF yok.");
+
+          const numericVariantId = String(item.variantId).split("/").pop();
+          const percent = toNumber(discountPercent || 0);
+
+          const newPrice = roundMoney(Number(item.psf) * (1 - percent / 100));
+
+          const variant = {
+            id: Number(numericVariantId),
+            price: String(newPrice),
+            compare_at_price: String(roundMoney(Number(item.psf)))
+          };
+
+          await shopifyRest(`/variants/${numericVariantId}.json`, {
+            method: "PUT",
+            body: JSON.stringify({ variant })
+          });
+
+          results.push({
+            ok: true,
+            variantId: item.variantId,
+            psf: item.psf,
+            newPrice,
+            action
+          });
+        }
+
+        if (action === "set_cost") {
+          if (!item.inventoryItemId) throw new Error("inventoryItemId eksik.");
+
+          const data = await shopifyGraphQL(
+            `
+            mutation inventoryItemUpdate($id: ID!, $input: InventoryItemInput!) {
+              inventoryItemUpdate(id: $id, input: $input) {
+                inventoryItem {
+                  id
+                  unitCost {
+                    amount
+                    currencyCode
+                  }
+                }
+                userErrors {
+                  message
+                }
+              }
+            }
+            `,
+            {
+              id: item.inventoryItemId,
+              input: {
+                cost: String(roundMoney(toNumber(cost)))
+              }
+            }
+          );
+
+          const errors = data.inventoryItemUpdate.userErrors || [];
+          if (errors.length) throw new Error(errors.map((e) => e.message).join(", "));
+
+          results.push({
+            ok: true,
+            inventoryItemId: item.inventoryItemId,
+            action
+          });
+        }
+      } catch (itemError) {
+        results.push({
+          ok: false,
+          item,
+          error: itemError.message
+        });
+      }
+    }
+
+    return res.json({
+      status: "ok",
+      total: items.length,
+      success: results.filter((r) => r.ok).length,
+      failed: results.filter((r) => !r.ok).length,
+      results
+    });
+  } catch (error) {
+    console.error("BULK PRODUCT ACTION ERROR:", error);
+    return res.status(500).json({
+      error: error.message || "Toplu işlem başarısız."
     });
   }
 });
@@ -1559,7 +1789,6 @@ JSON formatı:
       }
 
       const answerText = JSON.stringify(answers);
-
       const matchResult = await matchProductsFromShopify(answerText);
       const adviceStrategy = matchResult.strategy;
       const matchedProducts = matchResult.products;
