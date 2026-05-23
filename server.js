@@ -26,6 +26,9 @@ const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
 const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
 const SHOPIFY_ADMIN_ACCESS_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
 const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2025-10";
+const VAKIFBANK_MERCHANT_ID = process.env.VAKIFBANK_MERCHANT_ID;
+const VAKIFBANK_TERMINAL_ID = process.env.VAKIFBANK_TERMINAL_ID;
+const VAKIFBANK_API_PASSWORD = process.env.VAKIFBANK_API_PASSWORD;
 
 const CLAVIS_MODEL = process.env.CLAVIS_MODEL || "gpt-5.5";
 
@@ -1138,6 +1141,18 @@ app.get("/", (req, res) => {
 
 app.get("/health", (req, res) => {
   res.json({ status: "ok" });
+});
+app.get("/api/vakifbank-config-test", checkAdminPassword, (req, res) => {
+  return res.json({
+    status: "ok",
+    merchantIdExists: Boolean(VAKIFBANK_MERCHANT_ID),
+    terminalIdExists: Boolean(VAKIFBANK_TERMINAL_ID),
+    apiPasswordExists: Boolean(VAKIFBANK_API_PASSWORD),
+    merchantIdLast4: VAKIFBANK_MERCHANT_ID
+      ? String(VAKIFBANK_MERCHANT_ID).slice(-4)
+      : null,
+    terminalId: VAKIFBANK_TERMINAL_ID || null
+  });
 });
 
 /* -------------------------------
