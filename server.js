@@ -1142,7 +1142,7 @@ app.get("/", (req, res) => {
 app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
-app.get("/api/vakifbank-config-test", checkAdminPassword, (req, res) => {
+app.get("/api/vakifbank-config-test", (req, res) => {
   return res.json({
     status: "ok",
     merchantIdExists: Boolean(VAKIFBANK_MERCHANT_ID),
