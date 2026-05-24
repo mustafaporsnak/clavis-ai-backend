@@ -1198,21 +1198,47 @@ app.get("/pay/vakifbank", (req, res) => {
 app.post("/api/vakifbank-enrollment", express.urlencoded({ extended: true }), async (req, res) => {
   const { orderId, amount, cardNumber, expiryDate, cvv } = req.body || {};
 
-  console.log("VAKIFBANK ENROLLMENT FORM:", {
-    orderId,
-    amount,
-    cardNumberLast4: String(cardNumber || "").slice(-4),
-    expiryDate,
-    cvvExists: Boolean(cvv)
-  });
+const merchantPaymentId = `ORDER_${orderId}_${Date.now()}`;
 
-  return res.send(`
-    <h2>Test başarılı</h2>
-    <p>Sipariş: ${orderId}</p>
-    <p>Tutar: ${amount} TL</p>
-    <p>Kart son 4 hane: ${String(cardNumber || "").slice(-4)}</p>
-    <p>Bir sonraki adımda bu form VakıfBank 3D Secure başlatma servisine bağlanacak.</p>
-  `);
+return res.send(`
+<html>
+<head>
+<meta charset="UTF-8" />
+<title>3D Secure Yönlendirme</title>
+</head>
+<body style="font-family:Arial;padding:40px;">
+<h2>3D Secure yönlendiriliyor...</h2>
+
+<form id="vakifForm" method="POST" action="https://entegrasyon.asseco-see.com.tr/fim/est3Dgate">
+
+<input type="hidden" name="clientid" value="${VAKIFBANK_CLIENT_ID}" />
+<input type="hidden" name="storetype" value="3d_pay_hosting" />
+<input type="hidden" name="amount" value="${amount}" />
+<input type="hidden" name="oid" value="${merchantPaymentId}" />
+<input type="hidden" name="okUrl" value="https://expo-pharma.com" />
+<input type="hidden" name="failUrl" value="https://expo-pharma.com" />
+<input type="hidden" name="lang" value="tr" />
+<input type="hidden" name="rnd" value="${Date.now()}" />
+<input type="hidden" name="currency" value="949" />
+<input type="hidden" name="pan" value="${cardNumber}" />
+<input type="hidden" name="Ecom_Payment_Card_ExpDate_Month" value="${expiryDate.split('/')[0]}" />
+<input type="hidden" name="Ecom_Payment_Card_ExpDate_Year" value="20${expiryDate.split('/')[1]}" />
+<input type="hidden" name="cv2" value="${cvv}" />
+
+<button type="submit">
+3D Secure ile Devam Et
+</button>
+
+</form>
+
+<script>
+document.getElementById('vakifForm').submit();
+</script>
+
+</body>
+</html>
+`);
+  
 });
 app.post("/api/shopify-order-webhook", async (req, res) => {
   try {
