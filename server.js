@@ -1199,6 +1199,26 @@ app.post("/api/vakifbank-enrollment", express.urlencoded({ extended: true }), as
   const { orderId, amount, cardNumber, expiryDate, cvv } = req.body || {};
 
 const merchantPaymentId = `ORDER_${orderId}_${Date.now()}`;
+  const rnd = String(Date.now());
+const okUrl = "https://www.expo-pharma.com";
+const failUrl = "https://www.expo-pharma.com";
+const storeKey = VAKIFBANK_API_PASSWORD;
+
+const hashString =
+  VAKIFBANK_MERCHANT_ID +
+  merchantPaymentId +
+  amount +
+  okUrl +
+  failUrl +
+  "Auth" +
+  "" +
+  rnd +
+  storeKey;
+
+const hash = crypto
+  .createHash("sha512")
+  .update(hashString, "utf8")
+  .digest("base64");
 
 return res.send(`
 <html>
@@ -1211,6 +1231,7 @@ return res.send(`
 
 <form id="vakifForm" method="POST" action="https://entegrasyon.asseco-see.com.tr/fim/est3Dgate">
 
+<input type="hidden" name="hash" value="${hash}" />
 <input type="hidden" name="clientid" value="${VAKIFBANK_MERCHANT_ID}" />
 <input type="hidden" name="storetype" value="3d_pay_hosting" />
 <input type="hidden" name="amount" value="${amount}" />
@@ -1218,7 +1239,7 @@ return res.send(`
 <input type="hidden" name="okUrl" value="https://www.expo-pharma.com" />
 <input type="hidden" name="failUrl" value="https://www.expo-pharma.com" />
 <input type="hidden" name="lang" value="tr" />
-<input type="hidden" name="rnd" value="${Date.now()}" />
+<input type="hidden" name="rnd" value="${rnd}" />
 <input type="hidden" name="currency" value="949" />
 <input type="hidden" name="pan" value="${cardNumber}" />
 <input type="hidden" name="Ecom_Payment_Card_ExpDate_Month" value="${expiryDate.split('/')[0]}" />
