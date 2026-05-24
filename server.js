@@ -1154,6 +1154,38 @@ app.get("/api/vakifbank-config-test", (req, res) => {
     terminalId: VAKIFBANK_TERMINAL_ID || null
   });
 });
+function makeVakifbankPaymentUrl(order) {
+  const orderId = order.id || "";
+  const orderName = String(order.name || "").replace("#", "");
+  const amount = order.total_price || "0";
+
+  return `https://clavis-ai-backend.onrender.com/pay/vakifbank?orderId=${encodeURIComponent(orderId)}&orderName=${encodeURIComponent(orderName)}&amount=${encodeURIComponent(amount)}`;
+}
+
+app.get("/pay/vakifbank", (req, res) => {
+  const orderName = req.query.orderName || "";
+  const amount = req.query.amount || "";
+
+  res.send(`
+    <html>
+      <head>
+        <title>Güvenli Ödeme</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+      </head>
+      <body style="font-family:Arial; background:#f8fafc; padding:40px;">
+        <div style="max-width:520px; margin:auto; background:white; padding:30px; border-radius:16px; box-shadow:0 10px 30px rgba(0,0,0,.08);">
+          <h2>EXPO PHARMA Güvenli Ödeme</h2>
+          <p><b>Sipariş No:</b> #${orderName}</p>
+          <p><b>Tutar:</b> ${amount} TL</p>
+          <p>Ödeme işlemi VakıfBank sanal POS altyapısı üzerinden tamamlanacaktır.</p>
+          <button style="width:100%; padding:14px; border:0; border-radius:10px; background:#16a34a; color:white; font-size:16px; font-weight:bold;">
+            VakıfBank ile Ödemeye Devam Et
+          </button>
+        </div>
+      </body>
+    </html>
+  `);
+});
 app.post("/api/shopify-order-webhook", async (req, res) => {
   try {
     const order = req.body || {};
@@ -1168,6 +1200,10 @@ app.post("/api/shopify-order-webhook", async (req, res) => {
       paymentGatewayNames: order.payment_gateway_names,
       financialStatus: order.financial_status
     });
+
+    const paymentUrl = makeVakifbankPaymentUrl(order);
+console.log("VAKIFBANK PAYMENT URL:", paymentUrl);
+    
 
     return res.status(200).json({
       status: "ok",
