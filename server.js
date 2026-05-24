@@ -1182,6 +1182,7 @@ app.get("/pay/vakifbank", (req, res) => {
   <input type="hidden" name="orderId" value="${orderName}" />
   <input type="hidden" name="amount" value="${amount}" />
 
+  <input name="cardHolderName" placeholder="Kart Üzerindeki Ad Soyad" required style="width:100%; padding:12px; margin-bottom:10px;" />
   <input name="cardNumber" placeholder="Kart Numarası" required style="width:100%; padding:12px; margin-bottom:10px;" />
   <input name="expiryDate" placeholder="AA/YY" required style="width:100%; padding:12px; margin-bottom:10px;" />
   <input name="cvv" placeholder="CVV" required style="width:100%; padding:12px; margin-bottom:10px;" />
@@ -1196,7 +1197,7 @@ app.get("/pay/vakifbank", (req, res) => {
   `);
 });
 app.post("/api/vakifbank-enrollment", express.urlencoded({ extended: true }), async (req, res) => {
-  const { orderId, amount, cardNumber, expiryDate, cvv } = req.body || {};
+  const { orderId, amount, cardHolderName, cardNumber, expiryDate, cvv } = req.body || {};
 
 const merchantPaymentId = `ORDER_${orderId}_${Date.now()}`;
   const rnd = String(Date.now());
