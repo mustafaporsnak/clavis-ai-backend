@@ -1233,7 +1233,9 @@ return res.send(`
 
 <input type="hidden" name="hash" value="${hash}" />
 <input type="hidden" name="clientid" value="${VAKIFBANK_MERCHANT_ID}" />
-<input type="hidden" name="storetype" value="3d_pay_hosting" />
+<input type="hidden" name="storetype" value="3d_pay" />
+<input type="hidden" name="islemtipi" value="Auth" />
+<input type="hidden" name="taksit" value="" />
 <input type="hidden" name="amount" value="${amount}" />
 <input type="hidden" name="oid" value="${merchantPaymentId}" />
 <input type="hidden" name="okUrl" value="https://www.expo-pharma.com" />
