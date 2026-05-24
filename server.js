@@ -1178,12 +1178,40 @@ app.get("/pay/vakifbank", (req, res) => {
           <p><b>Sipariş No:</b> #${orderName}</p>
           <p><b>Tutar:</b> ${amount} TL</p>
           <p>Ödeme işlemi VakıfBank sanal POS altyapısı üzerinden tamamlanacaktır.</p>
-          <button style="width:100%; padding:14px; border:0; border-radius:10px; background:#16a34a; color:white; font-size:16px; font-weight:bold;">
-            VakıfBank ile Ödemeye Devam Et
-          </button>
+          <form method="POST" action="/api/vakifbank-enrollment">
+  <input type="hidden" name="orderId" value="${orderName}" />
+  <input type="hidden" name="amount" value="${amount}" />
+
+  <input name="cardNumber" placeholder="Kart Numarası" required style="width:100%; padding:12px; margin-bottom:10px;" />
+  <input name="expiryDate" placeholder="AA/YY" required style="width:100%; padding:12px; margin-bottom:10px;" />
+  <input name="cvv" placeholder="CVV" required style="width:100%; padding:12px; margin-bottom:10px;" />
+
+  <button type="submit" style="width:100%; padding:14px; border:0; border-radius:10px; background:#16a34a; color:white; font-size:16px; font-weight:bold;">
+    VakıfBank 3D Secure ile Öde
+  </button>
+</form>
         </div>
       </body>
     </html>
+  `);
+});
+app.post("/api/vakifbank-enrollment", express.urlencoded({ extended: true }), async (req, res) => {
+  const { orderId, amount, cardNumber, expiryDate, cvv } = req.body || {};
+
+  console.log("VAKIFBANK ENROLLMENT FORM:", {
+    orderId,
+    amount,
+    cardNumberLast4: String(cardNumber || "").slice(-4),
+    expiryDate,
+    cvvExists: Boolean(cvv)
+  });
+
+  return res.send(`
+    <h2>Test başarılı</h2>
+    <p>Sipariş: ${orderId}</p>
+    <p>Tutar: ${amount} TL</p>
+    <p>Kart son 4 hane: ${String(cardNumber || "").slice(-4)}</p>
+    <p>Bir sonraki adımda bu form VakıfBank 3D Secure başlatma servisine bağlanacak.</p>
   `);
 });
 app.post("/api/shopify-order-webhook", async (req, res) => {
