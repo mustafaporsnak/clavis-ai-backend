@@ -1142,18 +1142,17 @@ app.get("/", (req, res) => {
 app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
-app.get("/api/vakifbank-config-test", (req, res) => {
-  return res.json({
-    status: "ok",
-    merchantIdExists: Boolean(VAKIFBANK_MERCHANT_ID),
-    terminalIdExists: Boolean(VAKIFBANK_TERMINAL_ID),
-    apiPasswordExists: Boolean(VAKIFBANK_API_PASSWORD),
-    merchantIdLast4: VAKIFBANK_MERCHANT_ID
-      ? String(VAKIFBANK_MERCHANT_ID).slice(-4)
-      : null,
-    terminalId: VAKIFBANK_TERMINAL_ID || null
-  });
-});
+app.use(express.urlencoded({ extended: true }));
+
+const VAKIFBANK_CREATE_TOKEN_URL =
+  process.env.VAKIFBANK_CREATE_TOKEN_URL ||
+  "https://inbound.apigateway.vakifbank.com.tr:8443/commonPayment/CreateToken";
+
+function extractXmlValue(xml, tagName) {
+  const match = String(xml || "").match(new RegExp(`<${tagName}>(.*?)</${tagName}>`, "i"));
+  return match ? match[1] : "";
+}
+
 function makeVakifbankPaymentUrl(order) {
   const orderId = order.id || "";
   const orderName = String(order.name || "").replace("#", "");
@@ -1162,109 +1161,108 @@ function makeVakifbankPaymentUrl(order) {
   return `https://clavis-ai-backend.onrender.com/pay/vakifbank?orderId=${encodeURIComponent(orderId)}&orderName=${encodeURIComponent(orderName)}&amount=${encodeURIComponent(amount)}`;
 }
 
-app.get("/pay/vakifbank", (req, res) => {
-  const orderName = req.query.orderName || "";
-  const amount = req.query.amount || "";
-
-  res.send(`
-    <html>
-      <head>
-        <title>Güvenli Ödeme</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1" />
-      </head>
-      <body style="font-family:Arial; background:#f8fafc; padding:40px;">
-        <div style="max-width:520px; margin:auto; background:white; padding:30px; border-radius:16px; box-shadow:0 10px 30px rgba(0,0,0,.08);">
-          <h2>EXPO PHARMA Güvenli Ödeme</h2>
-          <p><b>Sipariş No:</b> #${orderName}</p>
-          <p><b>Tutar:</b> ${amount} TL</p>
-          <p>Ödeme işlemi VakıfBank sanal POS altyapısı üzerinden tamamlanacaktır.</p>
-          <form method="POST" action="/api/vakifbank-enrollment">
-  <input type="hidden" name="orderId" value="${orderName}" />
-  <input type="hidden" name="amount" value="${amount}" />
-
-  <input name="cardHolderName" placeholder="Kart Üzerindeki Ad Soyad" required style="width:100%; padding:12px; margin-bottom:10px;" />
-  <input name="cardNumber" placeholder="Kart Numarası" required style="width:100%; padding:12px; margin-bottom:10px;" />
-  <input name="expiryDate" placeholder="AA/YY" required style="width:100%; padding:12px; margin-bottom:10px;" />
-  <input name="cvv" placeholder="CVV" required style="width:100%; padding:12px; margin-bottom:10px;" />
-
-  <button type="submit" style="width:100%; padding:14px; border:0; border-radius:10px; background:#16a34a; color:white; font-size:16px; font-weight:bold;">
-    VakıfBank 3D Secure ile Öde
-  </button>
-</form>
-        </div>
-      </body>
-    </html>
-  `);
+app.get("/api/vakifbank-config-test", (req, res) => {
+  return res.json({
+    status: "ok",
+    merchantIdExists: Boolean(VAKIFBANK_MERCHANT_ID),
+    terminalIdExists: Boolean(VAKIFBANK_TERMINAL_ID),
+    apiPasswordExists: Boolean(VAKIFBANK_API_PASSWORD),
+    merchantIdLast4: VAKIFBANK_MERCHANT_ID ? String(VAKIFBANK_MERCHANT_ID).slice(-4) : null,
+    terminalId: VAKIFBANK_TERMINAL_ID || null
+  });
 });
-app.post("/api/vakifbank-enrollment", express.urlencoded({ extended: true }), async (req, res) => {
-  const { orderId, amount, cardHolderName, cardNumber, expiryDate, cvv } = req.body || {};
 
-const merchantPaymentId = `ORDER_${orderId}_${Date.now()}`;
-  const rnd = String(Date.now());
-const okUrl = "https://www.expo-pharma.com";
-const failUrl = "https://www.expo-pharma.com";
-const storeKey = VAKIFBANK_API_PASSWORD;
+app.get("/pay/vakifbank", async (req, res) => {
+  try {
+    const orderId = String(req.query.orderId || "").trim();
+    const orderName = String(req.query.orderName || "").replace("#", "").trim();
+    const amount = String(req.query.amount || "0").replace(",", ".").trim();
 
-const hashString =
-  VAKIFBANK_MERCHANT_ID +
-  merchantPaymentId +
-  amount +
-  okUrl +
-  failUrl +
-  "Auth" +
-  "" +
-  rnd +
-  storeKey;
+    const transactionId = `EXP${orderName || orderId}${Date.now()}`.replace(/[^a-zA-Z0-9]/g, "");
 
-const hash = crypto
-  .createHash("sha512")
-  .update(hashString, "utf8")
-  .digest("base64");
+    const form = new URLSearchParams();
+    form.append("Amount", amount);
+    form.append("AmountCode", "949");
+    form.append("IsSecure", "true");
+    form.append("HostMerchantID", VAKIFBANK_MERCHANT_ID);
+    form.append("HostTerminalId", VAKIFBANK_TERMINAL_ID);
+    form.append("MerchantPassword", VAKIFBANK_API_PASSWORD);
+    form.append("TransactionType", "Sale");
+    form.append("TransactionId", transactionId);
+    form.append("OrderId", orderName || orderId);
+    form.append("SuccessUrl", "https://www.expo-pharma.com/pages/odeme-basarili");
+    form.append("FailUrl", "https://www.expo-pharma.com/pages/odeme-basarisiz");
+    form.append("AllowNotEnrolledCard", "false");
+    form.append("TokenExpireTime", "1");
+    form.append("RequestLanguage", "tr-TR");
+    form.append("Extract", `EXPO PHARMA SIPARIS ${orderName || orderId}`);
 
-return res.send(`
-<html>
-<head>
-<meta charset="UTF-8" />
-<title>3D Secure Yönlendirme</title>
-</head>
-<body style="font-family:Arial;padding:40px;">
-<h2>3D Secure yönlendiriliyor...</h2>
+    const response = await fetch(VAKIFBANK_CREATE_TOKEN_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      body: form.toString()
+    });
 
-<form id="vakifForm" method="POST" action="https://entegrasyon.asseco-see.com.tr/fim/est3Dgate">
+    const text = await response.text();
 
-<input type="hidden" name="hash" value="${hash}" />
-<input type="hidden" name="clientid" value="${VAKIFBANK_MERCHANT_ID}" />
-<input type="hidden" name="storetype" value="3d_pay" />
-<input type="hidden" name="islemtipi" value="Auth" />
-<input type="hidden" name="amount" value="${amount}" />
-<input type="hidden" name="oid" value="${merchantPaymentId}" />
-<input type="hidden" name="okUrl" value="https://www.expo-pharma.com" />
-<input type="hidden" name="failUrl" value="https://www.expo-pharma.com" />
-<input type="hidden" name="lang" value="tr" />
-<input type="hidden" name="rnd" value="${rnd}" />
-<input type="hidden" name="currency" value="949" />
-<input type="hidden" name="pan" value="${cardNumber}" />
-<input type="hidden" name="Ecom_Payment_Card_ExpDate_Month" value="${expiryDate.split('/')[0]}" />
-<input type="hidden" name="Ecom_Payment_Card_ExpDate_Year" value="20${expiryDate.split('/')[1]}" />
-<input type="hidden" name="cv2" value="${cvv}" />
-<input type="hidden" name="currency" value="949" />
-<input type="hidden" name="txntype" value="Auth" />
-<input type="hidden" name="hashAlgorithm" value="ver3" />
+    console.log("VAKIFBANK CREATE TOKEN RESPONSE:", text);
 
-<button type="submit">
-3D Secure ile Devam Et
-</button>
+    const paymentToken = extractXmlValue(text, "PaymentToken");
+    const commonPaymentUrl = extractXmlValue(text, "CommonPaymentUrl");
+    const errorCode = extractXmlValue(text, "ErrorCode");
 
-</form>
+    if (!response.ok || errorCode || !paymentToken || !commonPaymentUrl) {
+      return res.status(500).send(`
+        <h2>Ödeme bağlantısı oluşturulamadı</h2>
+        <p>Hata Kodu: ${errorCode || "Bilinmiyor"}</p>
+        <pre>${text.replace(/</g, "&lt;").replace(/>/g, "&gt;")}</pre>
+      `);
+    }
 
-<script>
-document.getElementById('vakifForm').submit();
-</script>
+    const redirectUrl = `${commonPaymentUrl}${commonPaymentUrl.includes("?") ? "&" : "?"}Ptkn=${encodeURIComponent(paymentToken)}`;
 
-</body>
-</html>
-`);
-  
+    return res.redirect(302, redirectUrl);
+  } catch (error) {
+    console.error("VAKIFBANK PAYMENT ERROR:", error);
+    return res.status(500).send("Ödeme bağlantısı oluşturulurken hata oluştu.");
+  }
+});
+
+app.post("/api/shopify-order-webhook", async (req, res) => {
+  try {
+    const order = req.body || {};
+
+    console.log("SHOPIFY ORDER WEBHOOK GELDİ:", {
+      orderId: order.id,
+      orderName: order.name,
+      email: order.email,
+      phone: order.phone,
+      totalPrice: order.total_price,
+      currency: order.currency,
+      paymentGatewayNames: order.payment_gateway_names,
+      financialStatus: order.financial_status
+    });
+
+    const paymentUrl = makeVakifbankPaymentUrl(order);
+
+    console.log("REDIRECT PAYMENT URL:", paymentUrl);
+
+    return res.status(200).json({
+      status: "ok",
+      paymentUrl,
+      orderId: order.id || null,
+      orderName: order.name || null
+    });
+  } catch (error) {
+    console.error("SHOPIFY ORDER WEBHOOK ERROR:", error);
+
+    return res.status(200).json({
+      status: "error",
+      message: "Webhook alındı ama işlenemedi"
+    });
+  }
 });
 app.post("/api/shopify-order-webhook", async (req, res) => {
   try {
