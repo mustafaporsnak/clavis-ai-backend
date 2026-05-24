@@ -1229,16 +1229,16 @@ app.post("/api/shopify-order-webhook", async (req, res) => {
       financialStatus: order.financial_status
     });
 
-    const paymentUrl = makeVakifbankPaymentUrl(order);
-console.log("VAKIFBANK PAYMENT URL:", paymentUrl);
     
+const paymentUrl = makeVakifbankPaymentUrl(order);
 
+console.log("REDIRECT PAYMENT URL:", paymentUrl);
     return res.status(200).json({
-      status: "ok",
-      message: "Sipariş webhook alındı",
-      orderId: order.id || null,
-      orderName: order.name || null
-    });
+  status: "ok",
+  paymentUrl,
+  orderId: order.id || null,
+  orderName: order.name || null
+});
   } catch (error) {
     console.error("SHOPIFY ORDER WEBHOOK ERROR:", error);
 
