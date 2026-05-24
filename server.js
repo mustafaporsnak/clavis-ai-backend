@@ -1211,7 +1211,7 @@ return res.send(`
 
 <form id="vakifForm" method="POST" action="https://entegrasyon.asseco-see.com.tr/fim/est3Dgate">
 
-<input type="hidden" name="clientid" value="${VAKIFBANK_CLIENT_ID}" />
+<input type="hidden" name="clientid" value="${VAKIFBANK_MERCHANT_ID}" />
 <input type="hidden" name="storetype" value="3d_pay_hosting" />
 <input type="hidden" name="amount" value="${amount}" />
 <input type="hidden" name="oid" value="${merchantPaymentId}" />
