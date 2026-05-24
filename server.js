@@ -1154,6 +1154,36 @@ app.get("/api/vakifbank-config-test", (req, res) => {
     terminalId: VAKIFBANK_TERMINAL_ID || null
   });
 });
+app.post("/api/shopify-order-webhook", async (req, res) => {
+  try {
+    const order = req.body || {};
+
+    console.log("SHOPIFY ORDER WEBHOOK GELDİ:", {
+      orderId: order.id,
+      orderName: order.name,
+      email: order.email,
+      phone: order.phone,
+      totalPrice: order.total_price,
+      currency: order.currency,
+      paymentGatewayNames: order.payment_gateway_names,
+      financialStatus: order.financial_status
+    });
+
+    return res.status(200).json({
+      status: "ok",
+      message: "Sipariş webhook alındı",
+      orderId: order.id || null,
+      orderName: order.name || null
+    });
+  } catch (error) {
+    console.error("SHOPIFY ORDER WEBHOOK ERROR:", error);
+
+    return res.status(200).json({
+      status: "error",
+      message: "Webhook alındı ama işlenemedi"
+    });
+  }
+});
 
 /* -------------------------------
    ADMIN LOGIN
