@@ -1215,8 +1215,8 @@ return res.send(`
 <input type="hidden" name="storetype" value="3d_pay_hosting" />
 <input type="hidden" name="amount" value="${amount}" />
 <input type="hidden" name="oid" value="${merchantPaymentId}" />
-<input type="hidden" name="okUrl" value="https://expo-pharma.com" />
-<input type="hidden" name="failUrl" value="https://expo-pharma.com" />
+<input type="hidden" name="okUrl" value="https://www.expo-pharma.com" />
+<input type="hidden" name="failUrl" value="https://www.expo-pharma.com" />
 <input type="hidden" name="lang" value="tr" />
 <input type="hidden" name="rnd" value="${Date.now()}" />
 <input type="hidden" name="currency" value="949" />
