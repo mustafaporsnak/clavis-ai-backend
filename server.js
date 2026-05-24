@@ -1236,7 +1236,6 @@ return res.send(`
 <input type="hidden" name="clientid" value="${VAKIFBANK_MERCHANT_ID}" />
 <input type="hidden" name="storetype" value="3d_pay" />
 <input type="hidden" name="islemtipi" value="Auth" />
-<input type="hidden" name="taksit" value="" />
 <input type="hidden" name="amount" value="${amount}" />
 <input type="hidden" name="oid" value="${merchantPaymentId}" />
 <input type="hidden" name="okUrl" value="https://www.expo-pharma.com" />
@@ -1248,6 +1247,9 @@ return res.send(`
 <input type="hidden" name="Ecom_Payment_Card_ExpDate_Month" value="${expiryDate.split('/')[0]}" />
 <input type="hidden" name="Ecom_Payment_Card_ExpDate_Year" value="20${expiryDate.split('/')[1]}" />
 <input type="hidden" name="cv2" value="${cvv}" />
+<input type="hidden" name="currency" value="949" />
+<input type="hidden" name="txntype" value="Auth" />
+<input type="hidden" name="hashAlgorithm" value="ver3" />
 
 <button type="submit">
 3D Secure ile Devam Et
