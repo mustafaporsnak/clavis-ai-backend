@@ -1209,11 +1209,13 @@ app.get("/pay/vakifbank", async (req, res) => {
 
     console.log("VAKIFBANK CREATE TOKEN RESPONSE:", text);
 
-    const paymentToken = extractXmlValue(text, "PaymentToken");
-    const commonPaymentUrl = extractXmlValue(text, "CommonPaymentUrl");
-    const errorCode = extractXmlValue(text, "ErrorCode");
+    const data = JSON.parse(text);
 
-    if (!response.ok || errorCode || !paymentToken || !commonPaymentUrl) {
+const paymentToken = data.PaymentToken;
+const commonPaymentUrl = data.CommonPaymentUrl;
+const errorCode = data.ErrorCode;
+
+    if (!response.ok || errorCode !== "0000" || !paymentToken || !commonPaymentUrl) {
       return res.status(500).send(`
         <h2>Ödeme bağlantısı oluşturulamadı</h2>
         <p>Hata Kodu: ${errorCode || "Bilinmiyor"}</p>
@@ -1221,9 +1223,8 @@ app.get("/pay/vakifbank", async (req, res) => {
       `);
     }
 
-    const redirectUrl = `${commonPaymentUrl}${commonPaymentUrl.includes("?") ? "&" : "?"}Ptkn=${encodeURIComponent(paymentToken)}`;
-
-    return res.redirect(302, redirectUrl);
+    const redirectUrl = `${commonPaymentUrl}?Ptkn=${encodeURIComponent(paymentToken)}`;
+return res.redirect(302, redirectUrl);
   } catch (error) {
     console.error("VAKIFBANK PAYMENT ERROR:", error);
     return res.status(500).send("Ödeme bağlantısı oluşturulurken hata oluştu.");
