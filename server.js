@@ -26,9 +26,6 @@ const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;
 const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET;
 const SHOPIFY_ADMIN_ACCESS_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
 const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2025-10";
-const VAKIFBANK_MERCHANT_ID = process.env.VAKIFBANK_MERCHANT_ID;
-const VAKIFBANK_TERMINAL_ID = process.env.VAKIFBANK_TERMINAL_ID;
-const VAKIFBANK_API_PASSWORD = process.env.VAKIFBANK_API_PASSWORD;
 
 const CLAVIS_MODEL = process.env.CLAVIS_MODEL || "gpt-5.5";
 
@@ -652,7 +649,7 @@ function productToOperationRow(product, cost = null, profit = null) {
     Number(product.compareAtPrice || 0) ||
     Number(firstVariant.compareAtPrice || 0);
 
-  const recommendedPrice =
+const recommendedPrice =
     Number(cost?.recommendedPrice || 0) ||
     (psf > 0 ? roundMoney(psf * 0.95) : 0);
 
@@ -1135,101 +1132,21 @@ app.get("/", (req, res) => {
     updateVariant: "/api/update-variant-basic",
     updateInventoryItem: "/api/update-inventory-item",
     updateProductStatus: "/api/update-product-status",
-    bulkProductAction: "/api/bulk-product-action"
+    bulkProductAction: "/api/bulk-product-action",
+    orderWebhook: "/api/shopify-order-webhook"
   });
 });
 
 app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
+
 app.use(express.urlencoded({ extended: true }));
 
-const VAKIFBANK_CREATE_TOKEN_URL =
-  process.env.VAKIFBANK_CREATE_TOKEN_URL ||
-  "https://inbound.apigateway.vakifbank.com.tr:8443/commonPayment/CreateToken";
-
-function extractXmlValue(xml, tagName) {
-  const match = String(xml || "").match(new RegExp(`<${tagName}>(.*?)</${tagName}>`, "i"));
-  return match ? match[1] : "";
-}
-
-function makeVakifbankPaymentUrl(order) {
-  const orderId = order.id || "";
-  const orderName = String(order.name || "").replace("#", "");
-  const amount = order.total_price || "0";
-
-  return `https://clavis-ai-backend.onrender.com/pay/vakifbank?orderId=${encodeURIComponent(orderId)}&orderName=${encodeURIComponent(orderName)}&amount=${encodeURIComponent(amount)}`;
-}
-
-app.get("/api/vakifbank-config-test", (req, res) => {
-  return res.json({
-    status: "ok",
-    merchantIdExists: Boolean(VAKIFBANK_MERCHANT_ID),
-    terminalIdExists: Boolean(VAKIFBANK_TERMINAL_ID),
-    apiPasswordExists: Boolean(VAKIFBANK_API_PASSWORD),
-    merchantIdLast4: VAKIFBANK_MERCHANT_ID ? String(VAKIFBANK_MERCHANT_ID).slice(-4) : null,
-    terminalId: VAKIFBANK_TERMINAL_ID || null
-  });
-});
-
-app.get("/pay/vakifbank", async (req, res) => {
-  try {
-    const orderId = String(req.query.orderId || "").trim();
-    const orderName = String(req.query.orderName || "").replace("#", "").trim();
-    const amount = String(req.query.amount || "0").replace(",", ".").trim();
-
-    const transactionId = `EXP${orderName || orderId}${Date.now()}`.replace(/[^a-zA-Z0-9]/g, "");
-
-    const form = new URLSearchParams();
-    form.append("Amount", amount);
-    form.append("AmountCode", "949");
-    form.append("IsSecure", "true");
-    form.append("HostMerchantID", VAKIFBANK_MERCHANT_ID);
-    form.append("HostTerminalId", VAKIFBANK_TERMINAL_ID);
-    form.append("MerchantPassword", VAKIFBANK_API_PASSWORD);
-    form.append("TransactionType", "Sale");
-    form.append("TransactionId", transactionId);
-    form.append("OrderId", orderName || orderId);
-    form.append("SuccessUrl", "https://www.expo-pharma.com/pages/odeme-basarili");
-    form.append("FailUrl", "https://www.expo-pharma.com/pages/odeme-basarisiz");
-    form.append("AllowNotEnrolledCard", "false");
-    form.append("TokenExpireTime", "1");
-    form.append("RequestLanguage", "tr-TR");
-    form.append("Extract", `EXPO PHARMA SIPARIS ${orderName || orderId}`);
-
-    const response = await fetch(VAKIFBANK_CREATE_TOKEN_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded"
-      },
-      body: form.toString()
-    });
-
-    const text = await response.text();
-
-    console.log("VAKIFBANK CREATE TOKEN RESPONSE:", text);
-
-    const data = JSON.parse(text);
-
-const paymentToken = data.PaymentToken;
-const commonPaymentUrl = data.CommonPaymentUrl;
-const errorCode = data.ErrorCode;
-
-    if (!response.ok || errorCode !== "0000" || !paymentToken || !commonPaymentUrl) {
-      return res.status(500).send(`
-        <h2>Ödeme bağlantısı oluşturulamadı</h2>
-        <p>Hata Kodu: ${errorCode || "Bilinmiyor"}</p>
-        <pre>${text.replace(/</g, "&lt;").replace(/>/g, "&gt;")}</pre>
-      `);
-    }
-
-    const redirectUrl = `${commonPaymentUrl}?Ptkn=${encodeURIComponent(paymentToken)}`;
-return res.redirect(302, redirectUrl);
-  } catch (error) {
-    console.error("VAKIFBANK PAYMENT ERROR:", error);
-    return res.status(500).send("Ödeme bağlantısı oluşturulurken hata oluştu.");
-  }
-});
+/* -------------------------------
+   SHOPIFY ORDER WEBHOOK
+   VakıfBank yönlendirme kaldırıldı.
+-------------------------------- */
 
 app.post("/api/shopify-order-webhook", async (req, res) => {
   try {
@@ -1245,51 +1162,13 @@ app.post("/api/shopify-order-webhook", async (req, res) => {
       paymentGatewayNames: order.payment_gateway_names,
       financialStatus: order.financial_status
     });
-
-    const paymentUrl = makeVakifbankPaymentUrl(order);
-
-    console.log("REDIRECT PAYMENT URL:", paymentUrl);
 
     return res.status(200).json({
       status: "ok",
-      paymentUrl,
+      message: "Sipariş webhook alındı. Ödeme yönlendirmesi Shopify/iyzico tarafından yönetiliyor.",
       orderId: order.id || null,
       orderName: order.name || null
     });
-  } catch (error) {
-    console.error("SHOPIFY ORDER WEBHOOK ERROR:", error);
-
-    return res.status(200).json({
-      status: "error",
-      message: "Webhook alındı ama işlenemedi"
-    });
-  }
-});
-app.post("/api/shopify-order-webhook", async (req, res) => {
-  try {
-    const order = req.body || {};
-
-    console.log("SHOPIFY ORDER WEBHOOK GELDİ:", {
-      orderId: order.id,
-      orderName: order.name,
-      email: order.email,
-      phone: order.phone,
-      totalPrice: order.total_price,
-      currency: order.currency,
-      paymentGatewayNames: order.payment_gateway_names,
-      financialStatus: order.financial_status
-    });
-
-    
-const paymentUrl = makeVakifbankPaymentUrl(order);
-
-console.log("REDIRECT PAYMENT URL:", paymentUrl);
-    return res.status(200).json({
-  status: "ok",
-  paymentUrl,
-  orderId: order.id || null,
-  orderName: order.name || null
-});
   } catch (error) {
     console.error("SHOPIFY ORDER WEBHOOK ERROR:", error);
 
