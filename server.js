@@ -3,6 +3,7 @@ import cors from "cors";
 import dotenv from "dotenv";
 import OpenAI from "openai";
 import crypto from "crypto";
+import { chromium } from "playwright";
 
 dotenv.config();
 
@@ -104,6 +105,194 @@ function checkAdminPassword(req, res, next) {
 
   return next();
 }
+
+
+/* -------------------------------
+   BEK DEPO TARAYICI OTOMASYONU
+   İlk sürüm: tek barkod ve küçük toplu kontrol (salt okunur)
+-------------------------------- */
+
+const BEK_BASE_URL = process.env.BEK_BASE_URL || "https://esube.bek.org.tr/irj/portal/";
+const BEK_USERNAME = process.env.BEK_USERNAME;
+const BEK_PASSWORD = process.env.BEK_PASSWORD;
+
+function parseTurkishMoney(value) {
+  const match = String(value || "").match(/([\d.]+,\d{2})/);
+  if (!match) return null;
+  const number = Number(match[1].replaceAll(".", "").replace(",", "."));
+  return Number.isFinite(number) ? number : null;
+}
+
+async function findBekSearchInput(page) {
+  const selectors = [
+    'input[placeholder*="Kelime"]',
+    'input[placeholder*="Barkod"]',
+    'input[aria-label*="Kelime"]',
+    'input[aria-label*="Barkod"]'
+  ];
+
+  for (const frame of page.frames()) {
+    for (const selector of selectors) {
+      const locator = frame.locator(selector).first();
+      if (await locator.count()) {
+        try {
+          if (await locator.isVisible()) return locator;
+        } catch {}
+      }
+    }
+  }
+
+  // Son çare: giriş alanları dışındaki görünür metin kutusu.
+  for (const frame of page.frames()) {
+    const inputs = frame.locator('input[type="text"]:not(#logonuidfield)');
+    const count = await inputs.count();
+    for (let i = 0; i < count; i += 1) {
+      const locator = inputs.nth(i);
+      try {
+        if (await locator.isVisible()) return locator;
+      } catch {}
+    }
+  }
+
+  throw new Error("BEK ürün arama kutusu bulunamadı.");
+}
+
+async function loginBek(page) {
+  if (!BEK_USERNAME || !BEK_PASSWORD) {
+    throw new Error("BEK_USERNAME ve BEK_PASSWORD Render Environment içinde tanımlı değil.");
+  }
+
+  await page.goto(BEK_BASE_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
+
+  const username = page.locator("#logonuidfield");
+  const password = page.locator("#logonpassfield");
+
+  if (await username.count()) {
+    await username.fill(String(BEK_USERNAME));
+    await password.fill(String(BEK_PASSWORD));
+    await page.locator('input[name="login"]').click();
+    await page.waitForLoadState("domcontentloaded", { timeout: 60000 }).catch(() => {});
+  }
+
+  // Portal içeriğinin ve arama kutusunun hazır olmasını bekle.
+  const startedAt = Date.now();
+  let lastError = null;
+  while (Date.now() - startedAt < 60000) {
+    try {
+      return await findBekSearchInput(page);
+    } catch (error) {
+      lastError = error;
+      await page.waitForTimeout(1200);
+    }
+  }
+
+  throw lastError || new Error("BEK girişinden sonra ürün arama ekranı açılmadı.");
+}
+
+function pickBekProductName(lines, barcode) {
+  const barcodeIndex = lines.findIndex((line) => line.replace(/\D/g, "") === barcode);
+  if (barcodeIndex > 0) {
+    for (let i = barcodeIndex - 1; i >= Math.max(0, barcodeIndex - 6); i -= 1) {
+      const candidate = lines[i].trim();
+      if (
+        candidate.length >= 8 &&
+        !/^(PSF|DSF|Net Fiyat|Ürün Özellikleri|Satış Detayı|Stokta|Menü)$/i.test(candidate) &&
+        !/^₺/.test(candidate)
+      ) {
+        return candidate;
+      }
+    }
+  }
+  return "";
+}
+
+async function readBekProduct(page, requestedBarcode) {
+  await page.waitForFunction(
+    (barcode) => document.body && document.body.innerText.replace(/\D/g, "").includes(barcode),
+    requestedBarcode,
+    { timeout: 45000 }
+  ).catch(() => {});
+
+  await page.waitForTimeout(1200);
+  const bodyText = await page.locator("body").innerText();
+  const lines = bodyText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+
+  const normalizedBody = bodyText.replace(/\s+/g, " ");
+  const psfMatch = normalizedBody.match(/PSF[\s\S]{0,80}?₺?\s*([\d.]+,\d{2})/i);
+  const dsfMatch = normalizedBody.match(/DSF[\s\S]{0,80}?₺?\s*([\d.]+,\d{2})/i);
+  const netMatch = normalizedBody.match(/Net Fiyat[\s\S]{0,80}?₺?\s*([\d.]+,\d{2})/i);
+  const limitMatch = normalizedBody.match(/Kalan limitiniz\s*:\s*(\d+)/i);
+
+  const unavailable = /YETERLİ stok bulunamadı|malzeme satılamaz|Stokta Yok|Stok Yok/i.test(bodyText);
+  const available = !unavailable && /\bStokta\b/i.test(bodyText);
+
+  const pageBarcodeMatch = bodyText.match(/\b(\d{8,14})\b/);
+  const pageBarcode = lines.find((line) => line.replace(/\D/g, "") === requestedBarcode)
+    ? requestedBarcode
+    : (pageBarcodeMatch ? pageBarcodeMatch[1] : requestedBarcode);
+
+  const productName = pickBekProductName(lines, pageBarcode);
+
+  if (!productName && !psfMatch && !unavailable && !available) {
+    throw new Error("BEK ürün detay bilgileri okunamadı. Barkod bulunmamış veya sayfa yapısı değişmiş olabilir.");
+  }
+
+  return {
+    depot: "BEK",
+    requestedBarcode,
+    barcode: pageBarcode,
+    productName,
+    psf: psfMatch ? parseTurkishMoney(psfMatch[1]) : null,
+    dsf: dsfMatch ? parseTurkishMoney(dsfMatch[1]) : null,
+    netPrice: netMatch ? parseTurkishMoney(netMatch[1]) : null,
+    inStock: available ? true : unavailable ? false : null,
+    stockText: available ? "Stokta" : unavailable ? "Stokta yok / satılamaz" : "Belirsiz",
+    remainingLimit: limitMatch ? Number(limitMatch[1]) : null,
+    checkedAt: new Date().toISOString(),
+    url: page.url()
+  };
+}
+
+async function checkBekBarcode(barcode, existingContext = null) {
+  const cleanBarcode = String(barcode || "").replace(/\D/g, "");
+  if (cleanBarcode.length < 8 || cleanBarcode.length > 14) {
+    throw new Error("Geçerli bir barkod girin (8-14 rakam).");
+  }
+
+  let browser;
+  let context = existingContext;
+  let ownsContext = false;
+
+  try {
+    if (!context) {
+      browser = await chromium.launch({
+        headless: true,
+        args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+      });
+      context = await browser.newContext({
+        locale: "tr-TR",
+        timezoneId: "Europe/Istanbul",
+        viewport: { width: 1440, height: 1000 }
+      });
+      ownsContext = true;
+    }
+
+    const pages = context.pages();
+    const page = pages[0] || await context.newPage();
+    const searchInput = await loginBek(page);
+
+    await searchInput.fill(cleanBarcode);
+    await searchInput.press("Enter");
+
+    return await readBekProduct(page, cleanBarcode);
+  } finally {
+    if (ownsContext) {
+      await context?.close().catch(() => {});
+      await browser?.close().catch(() => {});
+    }
+  }
+}
+
 
 /* -------------------------------
    YARDIMCI FONKSİYONLAR
@@ -1116,6 +1305,91 @@ async function matchProductsFromShopify(answerText) {
 /* -------------------------------
    TEMEL ENDPOINTLER
 -------------------------------- */
+
+
+
+/* -------------------------------
+   BEK DEPO KONTROL ENDPOINTLERİ
+-------------------------------- */
+
+app.get("/api/depot/bek/status", checkAdminPassword, (req, res) => {
+  return res.json({
+    ok: true,
+    depot: "BEK",
+    configured: Boolean(BEK_USERNAME && BEK_PASSWORD),
+    baseUrl: BEK_BASE_URL,
+    mode: "read-only"
+  });
+});
+
+app.post("/api/depot/bek/check", checkAdminPassword, async (req, res) => {
+  try {
+    const result = await checkBekBarcode(req.body?.barcode);
+    return res.json({ ok: true, result });
+  } catch (error) {
+    console.error("BEK CHECK ERROR:", error);
+    return res.status(500).json({
+      error: error?.message || "BEK barkod kontrolü yapılamadı."
+    });
+  }
+});
+
+app.post("/api/depot/bek/check-batch", checkAdminPassword, async (req, res) => {
+  const barcodes = Array.from(new Set(
+    (Array.isArray(req.body?.barcodes) ? req.body.barcodes : [])
+      .map((value) => String(value || "").replace(/\D/g, ""))
+      .filter((value) => value.length >= 8 && value.length <= 14)
+  )).slice(0, 10);
+
+  if (!barcodes.length) {
+    return res.status(400).json({ error: "Kontrol edilecek barkod bulunamadı." });
+  }
+
+  let browser;
+  let context;
+  const results = [];
+
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+    });
+    context = await browser.newContext({
+      locale: "tr-TR",
+      timezoneId: "Europe/Istanbul",
+      viewport: { width: 1440, height: 1000 }
+    });
+
+    const page = await context.newPage();
+    let searchInput = await loginBek(page);
+
+    for (const barcode of barcodes) {
+      try {
+        await searchInput.fill(barcode);
+        await searchInput.press("Enter");
+        results.push({ ok: true, ...(await readBekProduct(page, barcode)) });
+
+        // Bir sonraki arama için üst arama kutusunu yeniden bul.
+        searchInput = await findBekSearchInput(page);
+      } catch (error) {
+        results.push({ ok: false, requestedBarcode: barcode, error: error?.message || "Kontrol edilemedi." });
+        try {
+          await page.goto(BEK_BASE_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
+          searchInput = await loginBek(page);
+        } catch {}
+      }
+    }
+
+    return res.json({ ok: true, count: results.length, results });
+  } catch (error) {
+    console.error("BEK BATCH ERROR:", error);
+    return res.status(500).json({ error: error?.message || "BEK toplu kontrolü yapılamadı." });
+  } finally {
+    await context?.close().catch(() => {});
+    await browser?.close().catch(() => {});
+  }
+});
+
 
 app.get("/", (req, res) => {
   res.json({
