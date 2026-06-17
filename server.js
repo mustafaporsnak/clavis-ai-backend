@@ -207,69 +207,119 @@ function pickBekProductName(lines, barcode) {
 }
 
 async function readBekProduct(page, requestedBarcode) {
-  // BEK ürün detay sayfası ana portalın içindeki ayrı bir iframe'de açılıyor.
-  // Bu nedenle yalnızca ana sayfanın body metnini değil, tüm frame'leri tarıyoruz.
-  const deadline = Date.now() + 45000;
-  let matchedFrame = null;
-  let bodyText = "";
+  // Arama kutusundaki barkod ana sayfada da göründüğü için sadece barkoda bakarak
+  // frame seçmek yanlış sonuç verebilir. Ürün detayını; barkod + fiyat/stok alanlarıyla
+  // birlikte puanlayarak buluyoruz.
+  const deadline = Date.now() + 60000;
+  let best = null;
 
   while (Date.now() < deadline) {
+    const candidates = [];
+
     for (const frame of page.frames()) {
       try {
-        const text = await frame.locator("body").innerText({ timeout: 3000 });
-        const digits = String(text || "").replace(/\D/g, "");
-        if (
-          digits.includes(requestedBarcode) ||
-          /\bPSF\b/i.test(text) ||
-          /Net Fiyat/i.test(text) ||
-          /YETERLİ stok bulunamadı|malzeme satılamaz|Stokta Yok|\bStokta\b/i.test(text)
-        ) {
-          matchedFrame = frame;
-          bodyText = text;
-          break;
-        }
+        const text = await frame.locator("body").innerText({ timeout: 3500 });
+        const normalized = String(text || "").replace(/\s+/g, " ").trim();
+        const digitsOnly = normalized.replace(/\D/g, "");
+
+        const hasBarcode = digitsOnly.includes(requestedBarcode);
+        const hasPsf = /\bPSF\b/i.test(normalized);
+        const hasDsf = /\bDSF\b/i.test(normalized);
+        const hasNet = /Net\s*Fiyat/i.test(normalized);
+        const hasStock = /YETERL[Iİ]\s+stok|malzeme sat[ıi]lamaz|Stokta\s*Yok|Stok\s*Yok|\bStokta\b/i.test(normalized);
+        const hasProductDetail = /Ürün\s*Özellikleri|Satış\s*Detayı|Siparişe?\s*1\s*Ekle/i.test(normalized);
+
+        let score = 0;
+        if (hasBarcode) score += 5;
+        if (hasPsf) score += 4;
+        if (hasDsf) score += 2;
+        if (hasNet) score += 3;
+        if (hasStock) score += 3;
+        if (hasProductDetail) score += 4;
+
+        candidates.push({ frame, text, normalized, score, hasBarcode, hasPsf, hasStock, hasProductDetail });
       } catch {}
     }
 
-    if (matchedFrame) break;
-    await page.waitForTimeout(1000);
+    candidates.sort((a, b) => b.score - a.score);
+    if (candidates[0] && (!best || candidates[0].score > best.score)) best = candidates[0];
+
+    // Ürün detay sayfası için barkodun yanında en az PSF veya stok ve detay işareti olmalı.
+    const exact = candidates.find((c) =>
+      c.hasBarcode && c.hasProductDetail && (c.hasPsf || c.hasStock)
+    );
+
+    if (exact) {
+      best = exact;
+      break;
+    }
+
+    await page.waitForTimeout(1200);
   }
 
-  if (!matchedFrame) {
-    const frameUrls = page.frames().map((frame) => frame.url()).join(" | ");
-    console.error("BEK DEBUG - frame URLs:", frameUrls);
-    throw new Error("BEK ürün detay iframe'i bulunamadı. Arama sonucu yüklenmemiş olabilir.");
+  if (!best || best.score < 8) {
+    console.error("BEK DEBUG - pages:", contextPageDebug(page));
+    console.error("BEK DEBUG - best candidate:", best ? {
+      url: best.frame.url(), score: best.score, preview: best.normalized.slice(0, 1800)
+    } : null);
+    throw new Error("BEK ürün detay sayfası yüklenemedi. Giriş veya barkod araması tamamlanmamış olabilir.");
   }
 
+  const matchedFrame = best.frame;
+  const bodyText = best.text;
+  const normalizedBody = best.normalized;
   const lines = bodyText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  const normalizedBody = bodyText.replace(/\s+/g, " ");
 
-  const psfMatch = normalizedBody.match(/PSF[\s\S]{0,120}?₺?\s*([\d.]+,\d{2})/i);
-  const dsfMatch = normalizedBody.match(/DSF[\s\S]{0,120}?₺?\s*([\d.]+,\d{2})/i);
-  const netMatch = normalizedBody.match(/Net Fiyat[\s\S]{0,120}?₺?\s*([\d.]+,\d{2})/i);
-  const limitMatch = normalizedBody.match(/Kalan limitiniz\s*:\s*(\d+)/i);
+  const moneyPattern = "(?:₺|TL)?\\s*([\\d.]+,\\d{2})";
+  const psfMatch = normalizedBody.match(new RegExp("\\bPSF\\b[\\s\\S]{0,100}?" + moneyPattern, "i"));
+  const dsfMatch = normalizedBody.match(new RegExp("\\bDSF\\b[\\s\\S]{0,100}?" + moneyPattern, "i"));
+  const netMatch = normalizedBody.match(new RegExp("Net\\s*Fiyat[\\s\\S]{0,100}?" + moneyPattern, "i"));
+  const limitMatch = normalizedBody.match(/Kalan\s+limitiniz\s*:\s*(\d+)/i);
 
-  const unavailable = /YETERLİ stok bulunamadı|malzeme satılamaz|Stokta Yok|Stok Yok/i.test(bodyText);
-  const available = !unavailable && /\bStokta\b/i.test(bodyText);
+  const unavailable = /YETERL[Iİ]\s+stok\s+bulunamad[ıi]|malzeme\s+sat[ıi]lamaz|Stokta\s*Yok|Stok\s*Yok/i.test(normalizedBody);
+  const available = !unavailable && /\bStokta\b/i.test(normalizedBody);
 
-  const exactBarcodeLine = lines.find((line) => line.replace(/\D/g, "") === requestedBarcode);
-  const pageBarcodeMatch = bodyText.match(/\b(\d{8,14})\b/);
-  const pageBarcode = exactBarcodeLine
-    ? requestedBarcode
-    : (pageBarcodeMatch ? pageBarcodeMatch[1] : requestedBarcode);
+  const exactBarcodeLineIndex = lines.findIndex((line) => line.replace(/\D/g, "") === requestedBarcode);
+  let productName = "";
 
-  const productName = pickBekProductName(lines, pageBarcode);
+  if (exactBarcodeLineIndex > 0) {
+    for (let i = exactBarcodeLineIndex - 1; i >= Math.max(0, exactBarcodeLineIndex - 8); i -= 1) {
+      const candidate = lines[i].trim();
+      if (
+        candidate.length >= 8 &&
+        !/^(PSF|DSF|Net Fiyat|Ürün Özellikleri|Satış Detayı|Stokta|Menü|Hepsi|İlaç|İlaç Dışı)$/i.test(candidate) &&
+        !/Daha Sonrası İçin Kaydedilenler/i.test(candidate) &&
+        !/Kelime, Barkod|arama yapabilmek/i.test(candidate) &&
+        !/^₺/.test(candidate) &&
+        !/^\d+$/.test(candidate)
+      ) {
+        productName = candidate;
+        break;
+      }
+    }
+  }
+
+  // Barkodun hemen üstünden ad bulunamazsa büyük harfli ve ürün benzeri satırı seç.
+  if (!productName) {
+    productName = lines.find((line) =>
+      line.length >= 10 &&
+      /[A-ZÇĞİÖŞÜ]/.test(line) &&
+      !/^(PSF|DSF|NET FİYAT|ÜRÜN ÖZELLİKLERİ|SATIŞ DETAYI|STOKTA|DAHA SONRASI)/i.test(line) &&
+      !/Kelime, Barkod|arama yapabilmek|Hesaplar ve Raporlar/i.test(line)
+    ) || "";
+  }
 
   if (!productName && !psfMatch && !unavailable && !available) {
-    console.error("BEK DEBUG - matched frame URL:", matchedFrame.url());
-    console.error("BEK DEBUG - body preview:", normalizedBody.slice(0, 1200));
-    throw new Error("BEK ürün detay bilgileri okunamadı. Ürün detay iframe'i açıldı ancak alanlar çözümlenemedi.");
+    console.error("BEK DEBUG - selected frame URL:", matchedFrame.url());
+    console.error("BEK DEBUG - selected score:", best.score);
+    console.error("BEK DEBUG - body preview:", normalizedBody.slice(0, 2200));
+    throw new Error("BEK ürün detay bilgileri okunamadı. Detay ekranı açıldı fakat alanlar çözümlenemedi.");
   }
 
   return {
     depot: "BEK",
     requestedBarcode,
-    barcode: pageBarcode,
+    barcode: requestedBarcode,
     productName,
     psf: psfMatch ? parseTurkishMoney(psfMatch[1]) : null,
     dsf: dsfMatch ? parseTurkishMoney(dsfMatch[1]) : null,
@@ -280,6 +330,10 @@ async function readBekProduct(page, requestedBarcode) {
     checkedAt: new Date().toISOString(),
     url: matchedFrame.url() || page.url()
   };
+}
+
+function contextPageDebug(page) {
+  return page.frames().map((frame) => frame.url()).join(" | ");
 }
 
 async function checkBekBarcode(barcode, existingContext = null) {
