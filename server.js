@@ -660,12 +660,40 @@ async function loginAlliance(page) {
     timeout: 60000
   });
 
-  const pharmacyCode = page.locator("#pharmacyCode");
+  const pharmacyCode = page.locator("#pharmacyCode").first();
   if (await pharmacyCode.count()) {
-    await pharmacyCode.fill(String(ALLIANCE_PHARMACY_CODE));
-    await page.locator("#Customer_username").fill(String(ALLIANCE_USERNAME));
-    await page.locator("#Customer_password").fill(String(ALLIANCE_PASSWORD));
-    await page.locator("button.Customer_login__button").click();
+    const usernameInput = page.locator("#Customer_username").first();
+    const passwordInput = page.locator("#Customer_password").first();
+
+    // Alliance giriş ekranı bazı oturumlarda kullanıcı adı/şifre alanlarını
+    // dinamik olarak readonly yapabiliyor. Önce alanları etkinleştiriyoruz.
+    for (const locator of [pharmacyCode, usernameInput, passwordInput]) {
+      await locator.waitFor({ state: "visible", timeout: 30000 });
+      await locator.evaluate((element) => {
+        element.removeAttribute("readonly");
+        element.removeAttribute("disabled");
+        element.style.pointerEvents = "auto";
+      });
+    }
+
+    await pharmacyCode.click();
+    await pharmacyCode.fill(String(ALLIANCE_PHARMACY_CODE), { force: true });
+    await pharmacyCode.press("Tab").catch(() => {});
+    await page.waitForTimeout(500);
+
+    // Eczane kodu doğrulamasından sonra readonly yeniden eklenirse tekrar kaldır.
+    for (const locator of [usernameInput, passwordInput]) {
+      await locator.evaluate((element) => {
+        element.removeAttribute("readonly");
+        element.removeAttribute("disabled");
+      });
+    }
+
+    await usernameInput.fill(String(ALLIANCE_USERNAME), { force: true });
+    await passwordInput.fill(String(ALLIANCE_PASSWORD), { force: true });
+
+    const loginButton = page.locator("button.Customer_login__button").first();
+    await loginButton.click({ force: true });
 
     await page.waitForLoadState("domcontentloaded", { timeout: 60000 }).catch(() => {});
   }
