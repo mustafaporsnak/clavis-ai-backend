@@ -118,6 +118,10 @@ const BEK_PASSWORD = process.env.BEK_PASSWORD;
 const ISKOOP_BASE_URL = process.env.ISKOOP_BASE_URL || "https://esube.iskoop.org/irj/portal/";
 const ISKOOP_USERNAME = process.env.ISKOOP_USERNAME;
 const ISKOOP_PASSWORD = process.env.ISKOOP_PASSWORD;
+const ALLIANCE_BASE_URL = process.env.ALLIANCE_BASE_URL || "https://esiparisv2.alliance-healthcare.com.tr/";
+const ALLIANCE_PHARMACY_CODE = process.env.ALLIANCE_PHARMACY_CODE;
+const ALLIANCE_USERNAME = process.env.ALLIANCE_USERNAME;
+const ALLIANCE_PASSWORD = process.env.ALLIANCE_PASSWORD;
 
 function parseTurkishMoney(value) {
   const match = String(value || "").match(/([\d.]+,\d{2})/);
@@ -609,6 +613,212 @@ async function checkIskoopBarcode(barcode, existingContext = null) {
     await searchInput.press("Enter");
 
     return await readIskoopProduct(page, cleanBarcode);
+  } finally {
+    if (ownsContext) {
+      await context?.close().catch(() => {});
+      await browser?.close().catch(() => {});
+    }
+  }
+}
+
+
+
+/* -------------------------------
+   CENCORA ALLIANCE HEALTHCARE DEPO TARAYICI OTOMASYONU
+   Salt okunur: barkod, ürün adı, depo fiyatı, net fiyat ve stok durumu.
+-------------------------------- */
+
+async function findAllianceSearchInput(page) {
+  const selectors = [
+    "#searchArea",
+    'input[name="search"]',
+    'input[placeholder*="En az 3 karakter"]',
+    "#searchText"
+  ];
+
+  for (const selector of selectors) {
+    const locator = page.locator(selector).first();
+    if (await locator.count()) {
+      try {
+        if (await locator.isVisible()) return locator;
+      } catch {}
+    }
+  }
+
+  throw new Error("Alliance ürün arama kutusu bulunamadı.");
+}
+
+async function loginAlliance(page) {
+  if (!ALLIANCE_PHARMACY_CODE || !ALLIANCE_USERNAME || !ALLIANCE_PASSWORD) {
+    throw new Error(
+      "ALLIANCE_PHARMACY_CODE, ALLIANCE_USERNAME ve ALLIANCE_PASSWORD Render Environment içinde tanımlı değil."
+    );
+  }
+
+  await page.goto(ALLIANCE_BASE_URL, {
+    waitUntil: "domcontentloaded",
+    timeout: 60000
+  });
+
+  const pharmacyCode = page.locator("#pharmacyCode");
+  if (await pharmacyCode.count()) {
+    await pharmacyCode.fill(String(ALLIANCE_PHARMACY_CODE));
+    await page.locator("#Customer_username").fill(String(ALLIANCE_USERNAME));
+    await page.locator("#Customer_password").fill(String(ALLIANCE_PASSWORD));
+    await page.locator("button.Customer_login__button").click();
+
+    await page.waitForLoadState("domcontentloaded", { timeout: 60000 }).catch(() => {});
+  }
+
+  const startedAt = Date.now();
+  let lastError = null;
+
+  while (Date.now() - startedAt < 60000) {
+    try {
+      return await findAllianceSearchInput(page);
+    } catch (error) {
+      lastError = error;
+      await page.waitForTimeout(1200);
+    }
+  }
+
+  const loginError = await page.locator(".validation-summary-errors, .alert-danger, #alert-panel")
+    .innerText({ timeout: 1500 })
+    .catch(() => "");
+
+  throw new Error(
+    loginError?.trim() ||
+    lastError?.message ||
+    "Alliance girişinden sonra ürün arama ekranı açılmadı."
+  );
+}
+
+async function readAllianceProduct(page, requestedBarcode) {
+  const deadline = Date.now() + 60000;
+  let bodyText = "";
+
+  while (Date.now() < deadline) {
+    bodyText = await page.locator("body").innerText({ timeout: 5000 }).catch(() => "");
+    const compact = String(bodyText || "").replace(/\s+/g, " ").trim();
+    const digits = compact.replace(/\D/g, "");
+
+    const hasBarcode = digits.includes(requestedBarcode);
+    const hasProduct = /AH\s*Ürün\s*Kodu|Ürün\s*Orjinal\s*Adı|Vergi\s*Hariç\s*Depocu\s*Satış\s*Fiyatı/i.test(compact);
+    const hasStock = /Stok\s*Durumu|Ürün\s*Stokta\s*Var|Ürün\s*Stokta\s*Yok|\bVar\b|\bYok\b/i.test(compact);
+
+    if (hasBarcode && (hasProduct || hasStock)) break;
+    await page.waitForTimeout(1000);
+  }
+
+  const compact = String(bodyText || "").replace(/\s+/g, " ").trim();
+  if (!compact.replace(/\D/g, "").includes(requestedBarcode)) {
+    console.error("ALLIANCE DEBUG URL:", page.url());
+    console.error("ALLIANCE DEBUG BODY:", compact.slice(0, 2500));
+    throw new Error("Alliance ürün bulunamadı veya ürün sayfası açılamadı.");
+  }
+
+  let productName = "";
+
+  productName = await page.locator("li.itembread a").last().innerText({ timeout: 2500 }).catch(() => "");
+  productName = String(productName || "").replace(new RegExp("^" + requestedBarcode + "\\s*-\\s*"), "").trim();
+
+  if (!productName) {
+    const originalNameText = compact.match(/Ürün\s*Orjinal\s*Adı\s+(.+?)(?:Tedarikçi\s*Firma|Saklama\s*Koşulu|Ürün\s*Sınıfı)/i);
+    productName = originalNameText?.[1]?.trim() || "";
+  }
+
+  if (!productName) {
+    const breadcrumbMatch = compact.match(new RegExp(requestedBarcode + "\\s*-\\s*(.{5,150}?)(?:AH\\s*Ürün\\s*Kodu|Ürün\\s*Orjinal\\s*Adı)", "i"));
+    productName = breadcrumbMatch?.[1]?.trim() || "";
+  }
+
+  // Alliance ürün sayfasında görünen "Vergi Hariç Depocu Satış Fiyatı".
+  let depotPrice = null;
+  const priceLabel = page.getByText(/Vergi Hariç Depocu Satış Fiyatı/i).first();
+  if (await priceLabel.count()) {
+    const containerText = await priceLabel.locator("xpath=..").innerText().catch(() => "");
+    depotPrice = parseTurkishMoney(containerText);
+  }
+
+  if (depotPrice === null) {
+    const priceMatch = compact.match(/Vergi\s*Hariç\s*Depocu\s*Satış\s*Fiyatı\s*([\d.]+,\d{2})/i);
+    depotPrice = priceMatch ? parseTurkishMoney(priceMatch[1]) : null;
+  }
+
+  // Sipariş hesap tablosundaki net fiyat.
+  let netPrice = null;
+  const calculatedNet = page.locator("#calculeted_netprice").first();
+  if (await calculatedNet.count()) {
+    netPrice = parseTurkishMoney(await calculatedNet.innerText().catch(() => ""));
+  }
+  if (netPrice === null) {
+    const netMatch = compact.match(/Net\s*Fiyat\s*([\d.]+,\d{2,3})/i);
+    netPrice = netMatch ? parseTurkishMoney(netMatch[1]) : null;
+  }
+
+  const hasStockIcon = await page.locator(".has-stock, i[title*='Stokta Var']").count();
+  const noStockIcon = await page.locator(".no-stock, i[title*='Stokta Yok']").count();
+  const unavailable = noStockIcon > 0 || /Stok\s*Durumu\s*Yok|Ürün\s*Stokta\s*Yok/i.test(compact);
+  const available = !unavailable && (hasStockIcon > 0 || /Stok\s*Durumu\s*Var|Ürün\s*Stokta\s*Var/i.test(compact));
+
+  const ahCodeMatch = compact.match(/AH\s*Ürün\s*Kodu\s*:\s*(\d+)/i);
+
+  if (!productName && depotPrice === null && !available && !unavailable) {
+    console.error("ALLIANCE DEBUG URL:", page.url());
+    console.error("ALLIANCE DEBUG BODY:", compact.slice(0, 3000));
+    throw new Error("Alliance ürün bilgileri okunamadı. Sayfa yapısı kontrol edilmeli.");
+  }
+
+  return {
+    depot: "Alliance Healthcare",
+    requestedBarcode,
+    barcode: requestedBarcode,
+    productName,
+    psf: null,
+    depotPrice,
+    netPrice,
+    inStock: available ? true : unavailable ? false : null,
+    stockText: available ? "Stokta" : unavailable ? "Stokta yok" : "Belirsiz",
+    allianceProductCode: ahCodeMatch ? ahCodeMatch[1] : null,
+    checkedAt: new Date().toISOString(),
+    url: page.url()
+  };
+}
+
+async function checkAllianceBarcode(barcode, existingContext = null) {
+  const cleanBarcode = String(barcode || "").replace(/\D/g, "");
+  if (cleanBarcode.length < 8 || cleanBarcode.length > 14) {
+    throw new Error("Geçerli bir barkod girin (8-14 rakam).");
+  }
+
+  let browser;
+  let context = existingContext;
+  let ownsContext = false;
+
+  try {
+    if (!context) {
+      browser = await chromium.launch({
+        headless: true,
+        args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+      });
+      context = await browser.newContext({
+        locale: "tr-TR",
+        timezoneId: "Europe/Istanbul",
+        viewport: { width: 1440, height: 1000 }
+      });
+      ownsContext = true;
+    }
+
+    const page = context.pages()[0] || await context.newPage();
+    const searchInput = await loginAlliance(page);
+
+    await searchInput.fill(cleanBarcode);
+    await Promise.all([
+      page.waitForLoadState("domcontentloaded", { timeout: 60000 }).catch(() => {}),
+      searchInput.press("Enter")
+    ]);
+
+    return await readAllianceProduct(page, cleanBarcode);
   } finally {
     if (ownsContext) {
       await context?.close().catch(() => {});
@@ -1793,6 +2003,61 @@ app.post("/api/depot/iskoop/check-batch", checkAdminPassword, async (req, res) =
     await context?.close().catch(() => {});
     await browser?.close().catch(() => {});
   }
+});
+
+
+
+/* -------------------------------
+   CENCORA ALLIANCE HEALTHCARE DEPO KONTROL ENDPOINTLERİ
+-------------------------------- */
+
+app.get("/api/depot/alliance/status", checkAdminPassword, (req, res) => {
+  return res.json({
+    ok: true,
+    depot: "Alliance Healthcare",
+    configured: Boolean(ALLIANCE_PHARMACY_CODE && ALLIANCE_USERNAME && ALLIANCE_PASSWORD),
+    baseUrl: ALLIANCE_BASE_URL,
+    mode: "read-only"
+  });
+});
+
+app.post("/api/depot/alliance/check", checkAdminPassword, async (req, res) => {
+  try {
+    const result = await checkAllianceBarcode(req.body?.barcode);
+    return res.json({ ok: true, result });
+  } catch (error) {
+    console.error("ALLIANCE CHECK ERROR:", error);
+    return res.status(500).json({
+      error: error?.message || "Alliance barkod kontrolü yapılamadı."
+    });
+  }
+});
+
+app.post("/api/depot/alliance/check-batch", checkAdminPassword, async (req, res) => {
+  const barcodes = Array.from(new Set(
+    (Array.isArray(req.body?.barcodes) ? req.body.barcodes : [])
+      .map((value) => String(value || "").replace(/\D/g, ""))
+      .filter((value) => value.length >= 8 && value.length <= 14)
+  )).slice(0, 10);
+
+  if (!barcodes.length) {
+    return res.status(400).json({ error: "Kontrol edilecek barkod bulunamadı." });
+  }
+
+  const results = [];
+  for (const barcode of barcodes) {
+    try {
+      results.push({ ok: true, ...(await checkAllianceBarcode(barcode)) });
+    } catch (error) {
+      results.push({
+        ok: false,
+        requestedBarcode: barcode,
+        error: error?.message || "Kontrol edilemedi."
+      });
+    }
+  }
+
+  return res.json({ ok: true, count: results.length, results });
 });
 
 
