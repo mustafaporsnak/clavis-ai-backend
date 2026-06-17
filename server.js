@@ -468,7 +468,7 @@ async function readIskoopProduct(page, requestedBarcode) {
         const digitsOnly = normalized.replace(/\D/g, "");
 
         const hasBarcode = digitsOnly.includes(requestedBarcode);
-        const hasPsf = /\bPSF\b/i.test(normalized);
+        const hasPsf = /\b(?:PSF|TVS)\b/i.test(normalized);
         const hasDsf = /\bDSF\b/i.test(normalized);
         const hasNet = /Net\s*Fiyat/i.test(normalized);
         const hasStock = /YETERL[Iİ]\s+stok|malzeme sat[ıi]lamaz|Stokta\s*Yok|Stok\s*Yok|\bStokta\b/i.test(normalized);
@@ -516,7 +516,7 @@ async function readIskoopProduct(page, requestedBarcode) {
   const lines = bodyText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 
   const moneyPattern = "(?:₺|TL)?\\s*([\\d.]+,\\d{2})";
-  const psfMatch = normalizedBody.match(new RegExp("\\bPSF\\b[\\s\\S]{0,100}?" + moneyPattern, "i"));
+  const psfMatch = normalizedBody.match(new RegExp("\\b(?:PSF|TVS)\\b[\\s\\S]{0,100}?" + moneyPattern, "i"));
   const dsfMatch = normalizedBody.match(new RegExp("\\bDSF\\b[\\s\\S]{0,100}?" + moneyPattern, "i"));
   const netMatch = normalizedBody.match(new RegExp("Net\\s*Fiyat[\\s\\S]{0,100}?" + moneyPattern, "i"));
   const limitMatch = normalizedBody.match(/Kalan\s+limitiniz\s*:\s*(\d+)/i);
@@ -532,7 +532,7 @@ async function readIskoopProduct(page, requestedBarcode) {
       const candidate = lines[i].trim();
       if (
         candidate.length >= 8 &&
-        !/^(PSF|DSF|Net Fiyat|Ürün Özellikleri|Satış Detayı|Stokta|Menü|Hepsi|İlaç|İlaç Dışı)$/i.test(candidate) &&
+        !/^(PSF|TVS|DSF|Net Fiyat|Ürün Özellikleri|Satış Detayı|Stokta|Menü|Hepsi|İlaç|İlaç Dışı)$/i.test(candidate) &&
         !/Daha Sonrası İçin Kaydedilenler/i.test(candidate) &&
         !/Kelime, Barkod|arama yapabilmek/i.test(candidate) &&
         !/^₺/.test(candidate) &&
@@ -549,7 +549,7 @@ async function readIskoopProduct(page, requestedBarcode) {
     productName = lines.find((line) =>
       line.length >= 10 &&
       /[A-ZÇĞİÖŞÜ]/.test(line) &&
-      !/^(PSF|DSF|NET FİYAT|ÜRÜN ÖZELLİKLERİ|SATIŞ DETAYI|STOKTA|DAHA SONRASI)/i.test(line) &&
+      !/^(PSF|TVS|DSF|NET FİYAT|ÜRÜN ÖZELLİKLERİ|SATIŞ DETAYI|STOKTA|DAHA SONRASI)/i.test(line) &&
       !/Kelime, Barkod|arama yapabilmek|Hesaplar ve Raporlar/i.test(line)
     ) || "";
   }
