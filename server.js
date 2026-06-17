@@ -115,6 +115,9 @@ function checkAdminPassword(req, res, next) {
 const BEK_BASE_URL = process.env.BEK_BASE_URL || "https://esube.bek.org.tr/irj/portal/";
 const BEK_USERNAME = process.env.BEK_USERNAME;
 const BEK_PASSWORD = process.env.BEK_PASSWORD;
+const ISKOOP_BASE_URL = process.env.ISKOOP_BASE_URL || "https://esube.iskoop.org/irj/portal/";
+const ISKOOP_USERNAME = process.env.ISKOOP_USERNAME;
+const ISKOOP_PASSWORD = process.env.ISKOOP_PASSWORD;
 
 function parseTurkishMoney(value) {
   const match = String(value || "").match(/([\d.]+,\d{2})/);
@@ -368,6 +371,244 @@ async function checkBekBarcode(barcode, existingContext = null) {
     await searchInput.press("Enter");
 
     return await readBekProduct(page, cleanBarcode);
+  } finally {
+    if (ownsContext) {
+      await context?.close().catch(() => {});
+      await browser?.close().catch(() => {});
+    }
+  }
+}
+
+
+/* -------------------------------
+   İSKOOP DEPO TARAYICI OTOMASYONU
+   BEK ile aynı portal altyapısını kullanır. Salt okunur.
+-------------------------------- */
+
+async function findIskoopSearchInput(page) {
+  const selectors = [
+    'input[placeholder*="Kelime"]',
+    'input[placeholder*="Barkod"]',
+    'input[aria-label*="Kelime"]',
+    'input[aria-label*="Barkod"]'
+  ];
+
+  for (const frame of page.frames()) {
+    for (const selector of selectors) {
+      const locator = frame.locator(selector).first();
+      if (await locator.count()) {
+        try {
+          if (await locator.isVisible()) return locator;
+        } catch {}
+      }
+    }
+  }
+
+  // Son çare: giriş alanları dışındaki görünür metin kutusu.
+  for (const frame of page.frames()) {
+    const inputs = frame.locator('input[type="text"]:not(#logonuidfield)');
+    const count = await inputs.count();
+    for (let i = 0; i < count; i += 1) {
+      const locator = inputs.nth(i);
+      try {
+        if (await locator.isVisible()) return locator;
+      } catch {}
+    }
+  }
+
+  throw new Error("İSKOOP ürün arama kutusu bulunamadı.");
+}
+
+async function loginIskoop(page) {
+  if (!ISKOOP_USERNAME || !ISKOOP_PASSWORD) {
+    throw new Error("ISKOOP_USERNAME ve ISKOOP_PASSWORD Render Environment içinde tanımlı değil.");
+  }
+
+  await page.goto(ISKOOP_BASE_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
+
+  const username = page.locator("#logonuidfield");
+  const password = page.locator("#logonpassfield");
+
+  if (await username.count()) {
+    await username.fill(String(ISKOOP_USERNAME));
+    await password.fill(String(ISKOOP_PASSWORD));
+    await page.locator('input[name="login"]').click();
+    await page.waitForLoadState("domcontentloaded", { timeout: 60000 }).catch(() => {});
+  }
+
+  // Portal içeriğinin ve arama kutusunun hazır olmasını iskoople.
+  const startedAt = Date.now();
+  let lastError = null;
+  while (Date.now() - startedAt < 60000) {
+    try {
+      return await findIskoopSearchInput(page);
+    } catch (error) {
+      lastError = error;
+      await page.waitForTimeout(1200);
+    }
+  }
+
+  throw lastError || new Error("İSKOOP girişinden sonra ürün arama ekranı açılmadı.");
+}
+
+async function readIskoopProduct(page, requestedBarcode) {
+  // Arama kutusundaki barkod ana sayfada da göründüğü için sadece barkoda bakarak
+  // frame seçmek yanlış sonuç verebilir. Ürün detayını; barkod + fiyat/stok alanlarıyla
+  // birlikte puanlayarak buluyoruz.
+  const deadline = Date.now() + 60000;
+  let best = null;
+
+  while (Date.now() < deadline) {
+    const candidates = [];
+
+    for (const frame of page.frames()) {
+      try {
+        const text = await frame.locator("body").innerText({ timeout: 3500 });
+        const normalized = String(text || "").replace(/\s+/g, " ").trim();
+        const digitsOnly = normalized.replace(/\D/g, "");
+
+        const hasBarcode = digitsOnly.includes(requestedBarcode);
+        const hasPsf = /\bPSF\b/i.test(normalized);
+        const hasDsf = /\bDSF\b/i.test(normalized);
+        const hasNet = /Net\s*Fiyat/i.test(normalized);
+        const hasStock = /YETERL[Iİ]\s+stok|malzeme sat[ıi]lamaz|Stokta\s*Yok|Stok\s*Yok|\bStokta\b/i.test(normalized);
+        const hasProductDetail = /Ürün\s*Özellikleri|Satış\s*Detayı|Siparişe?\s*1\s*Ekle/i.test(normalized);
+
+        let score = 0;
+        if (hasBarcode) score += 5;
+        if (hasPsf) score += 4;
+        if (hasDsf) score += 2;
+        if (hasNet) score += 3;
+        if (hasStock) score += 3;
+        if (hasProductDetail) score += 4;
+
+        candidates.push({ frame, text, normalized, score, hasBarcode, hasPsf, hasStock, hasProductDetail });
+      } catch {}
+    }
+
+    candidates.sort((a, b) => b.score - a.score);
+    if (candidates[0] && (!best || candidates[0].score > best.score)) best = candidates[0];
+
+    // Ürün detay sayfası için barkodun yanında en az PSF veya stok ve detay işareti olmalı.
+    const exact = candidates.find((c) =>
+      c.hasBarcode && c.hasProductDetail && (c.hasPsf || c.hasStock)
+    );
+
+    if (exact) {
+      best = exact;
+      break;
+    }
+
+    await page.waitForTimeout(1200);
+  }
+
+  if (!best || best.score < 8) {
+    console.error("İSKOOP DEBUG - pages:", contextPageDebug(page));
+    console.error("İSKOOP DEBUG - best candidate:", best ? {
+      url: best.frame.url(), score: best.score, preview: best.normalized.slice(0, 1800)
+    } : null);
+    throw new Error("İSKOOP ürün detay sayfası yüklenemedi. Giriş veya barkod araması tamamlanmamış olabilir.");
+  }
+
+  const matchedFrame = best.frame;
+  const bodyText = best.text;
+  const normalizedBody = best.normalized;
+  const lines = bodyText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+
+  const moneyPattern = "(?:₺|TL)?\\s*([\\d.]+,\\d{2})";
+  const psfMatch = normalizedBody.match(new RegExp("\\bPSF\\b[\\s\\S]{0,100}?" + moneyPattern, "i"));
+  const dsfMatch = normalizedBody.match(new RegExp("\\bDSF\\b[\\s\\S]{0,100}?" + moneyPattern, "i"));
+  const netMatch = normalizedBody.match(new RegExp("Net\\s*Fiyat[\\s\\S]{0,100}?" + moneyPattern, "i"));
+  const limitMatch = normalizedBody.match(/Kalan\s+limitiniz\s*:\s*(\d+)/i);
+
+  const unavailable = /YETERL[Iİ]\s+stok\s+bulunamad[ıi]|malzeme\s+sat[ıi]lamaz|Stokta\s*Yok|Stok\s*Yok/i.test(normalizedBody);
+  const available = !unavailable && /\bStokta\b/i.test(normalizedBody);
+
+  const exactBarcodeLineIndex = lines.findIndex((line) => line.replace(/\D/g, "") === requestedBarcode);
+  let productName = "";
+
+  if (exactBarcodeLineIndex > 0) {
+    for (let i = exactBarcodeLineIndex - 1; i >= Math.max(0, exactBarcodeLineIndex - 8); i -= 1) {
+      const candidate = lines[i].trim();
+      if (
+        candidate.length >= 8 &&
+        !/^(PSF|DSF|Net Fiyat|Ürün Özellikleri|Satış Detayı|Stokta|Menü|Hepsi|İlaç|İlaç Dışı)$/i.test(candidate) &&
+        !/Daha Sonrası İçin Kaydedilenler/i.test(candidate) &&
+        !/Kelime, Barkod|arama yapabilmek/i.test(candidate) &&
+        !/^₺/.test(candidate) &&
+        !/^\d+$/.test(candidate)
+      ) {
+        productName = candidate;
+        break;
+      }
+    }
+  }
+
+  // Barkodun hemen üstünden ad bulunamazsa büyük harfli ve ürün benzeri satırı seç.
+  if (!productName) {
+    productName = lines.find((line) =>
+      line.length >= 10 &&
+      /[A-ZÇĞİÖŞÜ]/.test(line) &&
+      !/^(PSF|DSF|NET FİYAT|ÜRÜN ÖZELLİKLERİ|SATIŞ DETAYI|STOKTA|DAHA SONRASI)/i.test(line) &&
+      !/Kelime, Barkod|arama yapabilmek|Hesaplar ve Raporlar/i.test(line)
+    ) || "";
+  }
+
+  if (!productName && !psfMatch && !unavailable && !available) {
+    console.error("İSKOOP DEBUG - selected frame URL:", matchedFrame.url());
+    console.error("İSKOOP DEBUG - selected score:", best.score);
+    console.error("İSKOOP DEBUG - body preview:", normalizedBody.slice(0, 2200));
+    throw new Error("İSKOOP ürün detay bilgileri okunamadı. Detay ekranı açıldı fakat alanlar çözümlenemedi.");
+  }
+
+  return {
+    depot: "İSKOOP",
+    requestedBarcode,
+    barcode: requestedBarcode,
+    productName,
+    psf: psfMatch ? parseTurkishMoney(psfMatch[1]) : null,
+    dsf: dsfMatch ? parseTurkishMoney(dsfMatch[1]) : null,
+    netPrice: netMatch ? parseTurkishMoney(netMatch[1]) : null,
+    inStock: available ? true : unavailable ? false : null,
+    stockText: available ? "Stokta" : unavailable ? "Stokta yok / satılamaz" : "Belirsiz",
+    remainingLimit: limitMatch ? Number(limitMatch[1]) : null,
+    checkedAt: new Date().toISOString(),
+    url: matchedFrame.url() || page.url()
+  };
+}
+
+async function checkIskoopBarcode(barcode, existingContext = null) {
+  const cleanBarcode = String(barcode || "").replace(/\D/g, "");
+  if (cleanBarcode.length < 8 || cleanBarcode.length > 14) {
+    throw new Error("Geçerli bir barkod girin (8-14 rakam).");
+  }
+
+  let browser;
+  let context = existingContext;
+  let ownsContext = false;
+
+  try {
+    if (!context) {
+      browser = await chromium.launch({
+        headless: true,
+        args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+      });
+      context = await browser.newContext({
+        locale: "tr-TR",
+        timezoneId: "Europe/Istanbul",
+        viewport: { width: 1440, height: 1000 }
+      });
+      ownsContext = true;
+    }
+
+    const pages = context.pages();
+    const page = pages[0] || await context.newPage();
+    const searchInput = await loginIskoop(page);
+
+    await searchInput.fill(cleanBarcode);
+    await searchInput.press("Enter");
+
+    return await readIskoopProduct(page, cleanBarcode);
   } finally {
     if (ownsContext) {
       await context?.close().catch(() => {});
@@ -1467,6 +1708,87 @@ app.post("/api/depot/bek/check-batch", checkAdminPassword, async (req, res) => {
   } catch (error) {
     console.error("BEK BATCH ERROR:", error);
     return res.status(500).json({ error: error?.message || "BEK toplu kontrolü yapılamadı." });
+  } finally {
+    await context?.close().catch(() => {});
+    await browser?.close().catch(() => {});
+  }
+});
+
+
+/* -------------------------------
+   İSKOOP DEPO KONTROL ENDPOINTLERİ
+-------------------------------- */
+
+app.get("/api/depot/iskoop/status", checkAdminPassword, (req, res) => {
+  return res.json({
+    ok: true,
+    depot: "İSKOOP",
+    configured: Boolean(ISKOOP_USERNAME && ISKOOP_PASSWORD),
+    baseUrl: ISKOOP_BASE_URL,
+    mode: "read-only"
+  });
+});
+
+app.post("/api/depot/iskoop/check", checkAdminPassword, async (req, res) => {
+  try {
+    const result = await checkIskoopBarcode(req.body?.barcode);
+    return res.json({ ok: true, result });
+  } catch (error) {
+    console.error("ISKOOP CHECK ERROR:", error);
+    return res.status(500).json({
+      error: error?.message || "İSKOOP barkod kontrolü yapılamadı."
+    });
+  }
+});
+
+app.post("/api/depot/iskoop/check-batch", checkAdminPassword, async (req, res) => {
+  const barcodes = Array.from(new Set(
+    (Array.isArray(req.body?.barcodes) ? req.body.barcodes : [])
+      .map((value) => String(value || "").replace(/\D/g, ""))
+      .filter((value) => value.length >= 8 && value.length <= 14)
+  )).slice(0, 10);
+
+  if (!barcodes.length) {
+    return res.status(400).json({ error: "Kontrol edilecek barkod bulunamadı." });
+  }
+
+  let browser;
+  let context;
+  const results = [];
+
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
+    });
+    context = await browser.newContext({
+      locale: "tr-TR",
+      timezoneId: "Europe/Istanbul",
+      viewport: { width: 1440, height: 1000 }
+    });
+
+    const page = await context.newPage();
+    let searchInput = await loginIskoop(page);
+
+    for (const barcode of barcodes) {
+      try {
+        await searchInput.fill(barcode);
+        await searchInput.press("Enter");
+        results.push({ ok: true, ...(await readIskoopProduct(page, barcode)) });
+        searchInput = await findIskoopSearchInput(page);
+      } catch (error) {
+        results.push({ ok: false, requestedBarcode: barcode, error: error?.message || "Kontrol edilemedi." });
+        try {
+          await page.goto(ISKOOP_BASE_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
+          searchInput = await loginIskoop(page);
+        } catch {}
+      }
+    }
+
+    return res.json({ ok: true, count: results.length, results });
+  } catch (error) {
+    console.error("ISKOOP BATCH ERROR:", error);
+    return res.status(500).json({ error: error?.message || "İSKOOP toplu kontrolü yapılamadı." });
   } finally {
     await context?.close().catch(() => {});
     await browser?.close().catch(() => {});
