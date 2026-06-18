@@ -126,6 +126,128 @@ const SANCAK_BASE_URL = process.env.SANCAK_BASE_URL || "https://eticaret.sancake
 const SANCAK_USERNAME = process.env.SANCAK_USERNAME;
 const SANCAK_PASSWORD = process.env.SANCAK_PASSWORD;
 
+
+/* -------------------------------
+   KALICI TARAYICI VE DEPO OTURUM HAVUZU
+   Render yeniden başlamadığı sürece oturumları ve sekmeleri açık tutar.
+-------------------------------- */
+
+let depotBrowserPromise = null;
+const depotSessions = new Map();
+const depotLocks = new Map();
+const depotResultCache = new Map();
+const DEPOT_CACHE_TTL_MS = 5 * 60 * 1000;
+
+async function getDepotBrowser() {
+  if (!depotBrowserPromise) {
+    depotBrowserPromise = chromium.launch({
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-background-networking",
+        "--disable-renderer-backgrounding"
+      ]
+    }).catch((error) => {
+      depotBrowserPromise = null;
+      throw error;
+    });
+  }
+  return depotBrowserPromise;
+}
+
+async function closeDepotSession(key) {
+  const session = depotSessions.get(key);
+  depotSessions.delete(key);
+  if (session) {
+    await session.context?.close().catch(() => {});
+  }
+}
+
+async function getDepotSession(key, loginFn) {
+  let session = depotSessions.get(key);
+  if (session && !session.page.isClosed()) return session;
+
+  const browser = await getDepotBrowser();
+  const context = await browser.newContext({
+    locale: "tr-TR",
+    timezoneId: "Europe/Istanbul",
+    viewport: { width: 1440, height: 1000 }
+  });
+  const page = await context.newPage();
+  page.setDefaultTimeout(30000);
+  page.setDefaultNavigationTimeout(60000);
+  await loginFn(page);
+  session = { context, page, createdAt: Date.now(), lastUsedAt: Date.now() };
+  depotSessions.set(key, session);
+  return session;
+}
+
+async function withDepotLock(key, task) {
+  const previous = depotLocks.get(key) || Promise.resolve();
+  let release;
+  const current = new Promise((resolve) => { release = resolve; });
+  depotLocks.set(key, previous.then(() => current));
+  await previous;
+  try {
+    return await task();
+  } finally {
+    release();
+    if (depotLocks.get(key) === current) depotLocks.delete(key);
+  }
+}
+
+function getCachedDepotResult(key, barcode) {
+  const item = depotResultCache.get(`${key}:${barcode}`);
+  if (!item || Date.now() - item.savedAt > DEPOT_CACHE_TTL_MS) return null;
+  return { ...item.result, cached: true };
+}
+
+function setCachedDepotResult(key, barcode, result) {
+  depotResultCache.set(`${key}:${barcode}`, { savedAt: Date.now(), result });
+}
+
+async function runPersistentDepotCheck({ key, barcode, loginFn, findSearchInput, executeSearch, readProduct }) {
+  const cleanBarcode = String(barcode || "").replace(/\D/g, "");
+  if (cleanBarcode.length < 8 || cleanBarcode.length > 14) {
+    throw new Error("Geçerli bir barkod girin (8-14 rakam).");
+  }
+
+  const cached = getCachedDepotResult(key, cleanBarcode);
+  if (cached) return cached;
+
+  return withDepotLock(key, async () => {
+    const cachedAfterWait = getCachedDepotResult(key, cleanBarcode);
+    if (cachedAfterWait) return cachedAfterWait;
+
+    let lastError;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const session = await getDepotSession(key, loginFn);
+        session.lastUsedAt = Date.now();
+        let input;
+        try {
+          input = await findSearchInput(session.page);
+        } catch {
+          await closeDepotSession(key);
+          const fresh = await getDepotSession(key, loginFn);
+          input = await findSearchInput(fresh.page);
+          session.page = fresh.page;
+        }
+        await executeSearch(session.page, input, cleanBarcode);
+        const result = await readProduct(session.page, cleanBarcode);
+        setCachedDepotResult(key, cleanBarcode, result);
+        return result;
+      } catch (error) {
+        lastError = error;
+        await closeDepotSession(key);
+      }
+    }
+    throw lastError || new Error("Depo kontrolü tamamlanamadı.");
+  });
+}
+
 function parseTurkishMoney(value) {
   const match = String(value || "").match(/([\d.]+,\d{2})/);
   if (!match) return null;
@@ -346,44 +468,19 @@ function contextPageDebug(page) {
   return page.frames().map((frame) => frame.url()).join(" | ");
 }
 
-async function checkBekBarcode(barcode, existingContext = null) {
-  const cleanBarcode = String(barcode || "").replace(/\D/g, "");
-  if (cleanBarcode.length < 8 || cleanBarcode.length > 14) {
-    throw new Error("Geçerli bir barkod girin (8-14 rakam).");
-  }
-
-  let browser;
-  let context = existingContext;
-  let ownsContext = false;
-
-  try {
-    if (!context) {
-      browser = await chromium.launch({
-        headless: true,
-        args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
-      });
-      context = await browser.newContext({
-        locale: "tr-TR",
-        timezoneId: "Europe/Istanbul",
-        viewport: { width: 1440, height: 1000 }
-      });
-      ownsContext = true;
-    }
-
-    const pages = context.pages();
-    const page = pages[0] || await context.newPage();
-    const searchInput = await loginBek(page);
-
-    await searchInput.fill(cleanBarcode);
-    await searchInput.press("Enter");
-
-    return await readBekProduct(page, cleanBarcode);
-  } finally {
-    if (ownsContext) {
-      await context?.close().catch(() => {});
-      await browser?.close().catch(() => {});
-    }
-  }
+async function checkBekBarcode(barcode) {
+  return runPersistentDepotCheck({
+    key: "bek",
+    barcode,
+    loginFn: loginBek,
+    findSearchInput: findBekSearchInput,
+    executeSearch: async (page, input, cleanBarcode) => {
+      await input.fill("");
+      await input.fill(cleanBarcode);
+      await input.press("Enter");
+    },
+    readProduct: readBekProduct
+  });
 }
 
 
@@ -584,44 +681,19 @@ async function readIskoopProduct(page, requestedBarcode) {
   };
 }
 
-async function checkIskoopBarcode(barcode, existingContext = null) {
-  const cleanBarcode = String(barcode || "").replace(/\D/g, "");
-  if (cleanBarcode.length < 8 || cleanBarcode.length > 14) {
-    throw new Error("Geçerli bir barkod girin (8-14 rakam).");
-  }
-
-  let browser;
-  let context = existingContext;
-  let ownsContext = false;
-
-  try {
-    if (!context) {
-      browser = await chromium.launch({
-        headless: true,
-        args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
-      });
-      context = await browser.newContext({
-        locale: "tr-TR",
-        timezoneId: "Europe/Istanbul",
-        viewport: { width: 1440, height: 1000 }
-      });
-      ownsContext = true;
-    }
-
-    const pages = context.pages();
-    const page = pages[0] || await context.newPage();
-    const searchInput = await loginIskoop(page);
-
-    await searchInput.fill(cleanBarcode);
-    await searchInput.press("Enter");
-
-    return await readIskoopProduct(page, cleanBarcode);
-  } finally {
-    if (ownsContext) {
-      await context?.close().catch(() => {});
-      await browser?.close().catch(() => {});
-    }
-  }
+async function checkIskoopBarcode(barcode) {
+  return runPersistentDepotCheck({
+    key: "iskoop",
+    barcode,
+    loginFn: loginIskoop,
+    findSearchInput: findIskoopSearchInput,
+    executeSearch: async (page, input, cleanBarcode) => {
+      await input.fill("");
+      await input.fill(cleanBarcode);
+      await input.press("Enter");
+    },
+    readProduct: readIskoopProduct
+  });
 }
 
 
@@ -817,46 +889,20 @@ async function readAllianceProduct(page, requestedBarcode) {
   };
 }
 
-async function checkAllianceBarcode(barcode, existingContext = null) {
-  const cleanBarcode = String(barcode || "").replace(/\D/g, "");
-  if (cleanBarcode.length < 8 || cleanBarcode.length > 14) {
-    throw new Error("Geçerli bir barkod girin (8-14 rakam).");
-  }
-
-  let browser;
-  let context = existingContext;
-  let ownsContext = false;
-
-  try {
-    if (!context) {
-      browser = await chromium.launch({
-        headless: true,
-        args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"]
-      });
-      context = await browser.newContext({
-        locale: "tr-TR",
-        timezoneId: "Europe/Istanbul",
-        viewport: { width: 1440, height: 1000 }
-      });
-      ownsContext = true;
-    }
-
-    const page = context.pages()[0] || await context.newPage();
-    const searchInput = await loginAlliance(page);
-
-    await searchInput.fill(cleanBarcode);
-    await Promise.all([
-      page.waitForLoadState("domcontentloaded", { timeout: 60000 }).catch(() => {}),
-      searchInput.press("Enter")
-    ]);
-
-    return await readAllianceProduct(page, cleanBarcode);
-  } finally {
-    if (ownsContext) {
-      await context?.close().catch(() => {});
-      await browser?.close().catch(() => {});
-    }
-  }
+async function checkAllianceBarcode(barcode) {
+  return runPersistentDepotCheck({
+    key: "alliance",
+    barcode,
+    loginFn: loginAlliance,
+    findSearchInput: findAllianceSearchInput,
+    executeSearch: async (page, input, cleanBarcode) => {
+      await input.fill("");
+      await input.fill(cleanBarcode);
+      await input.press("Enter").catch(() => {});
+      await page.waitForTimeout(900);
+    },
+    readProduct: readAllianceProduct
+  });
 }
 
 
@@ -941,8 +987,9 @@ async function readSancakProduct(page, requestedBarcode) {
     netPrice = netMatch ? parseTurkishMoney(netMatch[1]) : null;
   }
 
-  const unavailable = /Stokta Yok/i.test(compact);
-  const available = !unavailable && /\bStokta\b/i.test(compact);
+  const unavailable = /Stokta Yok|Tükendi|Stok Bulunmuyor/i.test(compact);
+  const hasLoadedProduct = Boolean(productName) && (psfMatch || depotMatch);
+  const available = !unavailable && (/\bStokta\b/i.test(compact) || hasLoadedProduct);
   const idMatch = compact.match(/\bID\s*(\d+)/i);
   const expiryMatch = compact.match(/Miad\s*(\d{2}\.\d{4})/i);
 
@@ -963,26 +1010,26 @@ async function readSancakProduct(page, requestedBarcode) {
   };
 }
 
-async function checkSancakBarcode(barcode, existingContext = null) {
-  const cleanBarcode = String(barcode || "").replace(/\D/g, "");
-  if (cleanBarcode.length < 8 || cleanBarcode.length > 14) throw new Error("Geçerli bir barkod girin (8-14 rakam).");
-
-  let browser; let context = existingContext; let ownsContext = false;
-  try {
-    if (!context) {
-      browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"] });
-      context = await browser.newContext({ locale: "tr-TR", timezoneId: "Europe/Istanbul", viewport: { width: 1440, height: 1000 } });
-      ownsContext = true;
-    }
-    const page = context.pages()[0] || await context.newPage();
-    const searchInput = await loginSancak(page);
-    await searchInput.fill(cleanBarcode);
-    await searchInput.press("Enter");
-    await page.waitForTimeout(1500);
-    return await readSancakProduct(page, cleanBarcode);
-  } finally {
-    if (ownsContext) { await context?.close().catch(() => {}); await browser?.close().catch(() => {}); }
-  }
+async function checkSancakBarcode(barcode) {
+  return runPersistentDepotCheck({
+    key: "sancak",
+    barcode,
+    loginFn: loginSancak,
+    findSearchInput: findSancakSearchInput,
+    executeSearch: async (page, input, cleanBarcode) => {
+      // Sancak'ta Enter kullanılmaz. Barkod yazılınca sonuç satırı ve alt çekmece otomatik açılır.
+      await input.fill("");
+      await input.fill(cleanBarcode);
+      await page.waitForTimeout(1800);
+      await page.waitForFunction(
+        (value) => document.body && document.body.innerText.replace(/\\D/g, "").includes(value),
+        cleanBarcode,
+        { timeout: 20000 }
+      ).catch(() => {});
+      await page.waitForTimeout(700);
+    },
+    readProduct: readSancakProduct
+  });
 }
 
 
