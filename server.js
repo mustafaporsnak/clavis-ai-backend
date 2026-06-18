@@ -952,59 +952,47 @@ async function loginSancak(page) {
 }
 
 async function readSancakProduct(page, requestedBarcode) {
-  const deadline = Date.now() + 60000;
-  let bodyText = "";
-  while (Date.now() < deadline) {
-    bodyText = await page.locator('body').innerText({ timeout: 5000 }).catch(() => "");
-    const compact = String(bodyText || "").replace(/\s+/g, " ");
-    if (compact.replace(/\D/g, "").includes(requestedBarcode) && /Perakende Fiyat|Önerilen PSF|Depocu Fiyatı/i.test(compact)) break;
-    await page.waitForTimeout(1000);
+  const drawer = page.locator('#search-detay.siparis-detay-modal.active').first();
+  const barcodeLocator = drawer.locator('.product-general-info .urun-kodu').filter({ hasText: requestedBarcode }).first();
+
+  await barcodeLocator.waitFor({ state: 'visible', timeout: 15000 }).catch(() => {});
+  if (!(await barcodeLocator.count()) || !(await barcodeLocator.isVisible().catch(() => false))) {
+    throw new Error('Sancak ürün çekmecesi açılamadı veya barkod bulunamadı.');
   }
 
-  const compact = String(bodyText || "").replace(/\s+/g, " ").trim();
-  if (!compact.replace(/\D/g, "").includes(requestedBarcode)) {
-    throw new Error("Sancak ürün bulunamadı veya ürün sayfası açılamadı.");
-  }
-
-  let productName = "";
-  const barcodeNode = page.locator('.product-general-info .urun-kodu').filter({ hasText: requestedBarcode }).first();
-  if (await barcodeNode.count()) {
-    const detailRoot = barcodeNode.locator('xpath=ancestor::div[contains(@class,"siparis-detay-bilgiler")][1]');
-    productName = await detailRoot.locator('h2').first().innerText().catch(() => "");
-  }
-  if (!productName) {
-    productName = await page.locator('h2').filter({ hasText: /./ }).first().innerText().catch(() => "");
-  }
-
-  const psfMatch = compact.match(/(?:Perakende Fiyat(?:ı)?|Önerilen PSF)\s*:?[\s]*([\d.]+,\d{2})\s*₺?/i);
-  const depotMatch = compact.match(/Depocu Fiyatı\s*:?[\s]*([\d.]+,\d{2})\s*₺?/i);
+  const productName = (await drawer.locator('.urun-adi h2').first().innerText().catch(() => '')).trim();
+  const psf = parseTurkishMoney(await drawer.locator('.product-general-info .list-price').first().innerText().catch(() => ''));
+  const depotPrice = parseTurkishMoney(await drawer.locator('.product-general-info .sales-price').first().innerText().catch(() => ''));
 
   let netPrice = null;
-  const netLocator = page.locator('.afternetprice').first();
-  if (await netLocator.count()) netPrice = parseTurkishMoney(await netLocator.innerText().catch(() => ""));
+  const selectedPayment = drawer.locator('#siparis-detay-bilgiler-offering-content ul').filter({
+    has: drawer.locator('input[name="PaymentTypeSelector"]:checked')
+  }).first();
+  if (await selectedPayment.count()) {
+    netPrice = parseTurkishMoney(await selectedPayment.locator('.net-price').first().innerText().catch(() => ''));
+  }
   if (netPrice === null) {
-    const netMatch = compact.match(/KDV\s*Dahil\s*Birim\s*Fiyatı\s*([\d.]+,\d{2})/i);
-    netPrice = netMatch ? parseTurkishMoney(netMatch[1]) : null;
+    netPrice = parseTurkishMoney(await drawer.locator('#siparis-detay-bilgiler-offering-content .net-price').first().innerText().catch(() => ''));
   }
 
-  const unavailable = /Stokta Yok|Tükendi|Stok Bulunmuyor/i.test(compact);
-  const hasLoadedProduct = Boolean(productName) && (psfMatch || depotMatch);
-  const available = !unavailable && (/\bStokta\b/i.test(compact) || hasLoadedProduct);
-  const idMatch = compact.match(/\bID\s*(\d+)/i);
-  const expiryMatch = compact.match(/Miad\s*(\d{2}\.\d{4})/i);
+  const idText = await drawer.locator('.product-general-info .urun-id').first().innerText().catch(() => '');
+  const expiryText = await drawer.locator('.product-general-info .miad').first().innerText().catch(() => '');
+  const row = page.locator('.search-result-row.current').first();
+  const unavailable = await drawer.locator('text=Stokta Yok').count() > 0 || await row.locator('.badge-sm:not(.active)').count() > 0;
+  const available = !unavailable && (await row.locator('.badge-sm.active').count() > 0 || Boolean(productName));
 
   return {
-    depot: "Sancak Ecza Deposu",
+    depot: 'Sancak Ecza Deposu',
     requestedBarcode,
     barcode: requestedBarcode,
-    productName: String(productName || "").trim(),
-    psf: psfMatch ? parseTurkishMoney(psfMatch[1]) : null,
-    depotPrice: depotMatch ? parseTurkishMoney(depotMatch[1]) : null,
+    productName,
+    psf,
+    depotPrice,
     netPrice,
     inStock: available ? true : unavailable ? false : null,
-    stockText: available ? "Stokta" : unavailable ? "Stokta yok" : "Belirsiz",
-    sancakProductId: idMatch ? idMatch[1] : null,
-    expiry: expiryMatch ? expiryMatch[1] : null,
+    stockText: available ? 'Stokta' : unavailable ? 'Stokta yok' : 'Belirsiz',
+    sancakProductId: String(idText || '').replace(/\D/g, '') || null,
+    expiry: String(expiryText || '').trim() || null,
     checkedAt: new Date().toISOString(),
     url: page.url()
   };
@@ -1012,21 +1000,35 @@ async function readSancakProduct(page, requestedBarcode) {
 
 async function checkSancakBarcode(barcode) {
   return runPersistentDepotCheck({
-    key: "sancak",
+    key: 'sancak',
     barcode,
     loginFn: loginSancak,
     findSearchInput: findSancakSearchInput,
     executeSearch: async (page, input, cleanBarcode) => {
-      // Sancak'ta Enter kullanılmaz. Barkod yazılınca sonuç satırı ve alt çekmece otomatik açılır.
-      await input.fill("");
-      await input.fill(cleanBarcode);
-      await page.waitForTimeout(1800);
-      await page.waitForFunction(
-        (value) => document.body && document.body.innerText.replace(/\\D/g, "").includes(value),
-        cleanBarcode,
-        { timeout: 20000 }
-      ).catch(() => {});
-      await page.waitForTimeout(700);
+      // Önce eski çekmeceyi kapat; ardından gerçek klavye olaylarıyla arama yap.
+      const closeButton = page.locator('#siparis-detay-close').first();
+      if (await closeButton.isVisible().catch(() => false)) {
+        await closeButton.click({ timeout: 3000 }).catch(() => {});
+      }
+
+      await input.click();
+      await input.fill('');
+      await input.pressSequentially(cleanBarcode, { delay: 35 });
+      await input.dispatchEvent('input');
+      await input.dispatchEvent('keyup');
+
+      const resultRow = page.locator('.search-result-row.current').first();
+      await resultRow.waitFor({ state: 'visible', timeout: 12000 });
+
+      const drawerBarcode = page.locator('#search-detay.siparis-detay-modal.active .product-general-info .urun-kodu')
+        .filter({ hasText: cleanBarcode }).first();
+
+      // Site bazı oturumlarda çekmeceyi otomatik açmazsa sonuç adına bir kez tıkla.
+      if (!(await drawerBarcode.isVisible().catch(() => false))) {
+        await resultRow.locator('[data-hedef="#search-detay"], .item-name-td span').first().click({ timeout: 4000 }).catch(() => {});
+      }
+
+      await drawerBarcode.waitFor({ state: 'visible', timeout: 12000 });
     },
     readProduct: readSancakProduct
   });
