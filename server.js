@@ -1011,11 +1011,43 @@ async function checkSancakBarcode(barcode) {
         await closeButton.click({ timeout: 3000 }).catch(() => {});
       }
 
-      await input.click();
-      await input.fill('');
-      await input.pressSequentially(cleanBarcode, { delay: 35 });
-      await input.dispatchEvent('input');
-      await input.dispatchEvent('keyup');
+      // Sancak zaman zaman arama kutusunun üstünde kampanya/modal katmanı bırakıyor.
+      // Önce görünür modalı kapatmayı dene; kapanmazsa yalnızca tıklamayı engelleyen katmanı kaldır.
+      const modalCloseSelectors = [
+        '.modal-v2area button.close',
+        '.modal-v2area .close',
+        '.modal-v2area [data-dismiss="modal"]',
+        '.modal-v2area .modal-close',
+        '.modal-v2area .btn-close'
+      ];
+      for (const selector of modalCloseSelectors) {
+        const close = page.locator(selector).first();
+        if (await close.isVisible().catch(() => false)) {
+          await close.click({ force: true, timeout: 1500 }).catch(() => {});
+          await page.waitForTimeout(250);
+          break;
+        }
+      }
+
+      await page.evaluate(() => {
+        document.querySelectorAll('.modal-v2area').forEach((el) => {
+          const style = window.getComputedStyle(el);
+          if (style.pointerEvents !== 'none' && style.display !== 'none') {
+            el.style.pointerEvents = 'none';
+          }
+        });
+      });
+
+      // click/fill kullanma: üst katman olsa bile değeri doğrudan yaz ve gerçek input olaylarını üret.
+      await input.evaluate((el, value) => {
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+        if (setter) setter.call(el, ''); else el.value = '';
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        if (setter) setter.call(el, value); else el.value = value;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new KeyboardEvent('keyup', { key: value.slice(-1), bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      }, cleanBarcode);
 
       const resultRow = page.locator('.search-result-row.current').first();
       await resultRow.waitFor({ state: 'visible', timeout: 12000 });
