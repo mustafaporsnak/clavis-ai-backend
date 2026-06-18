@@ -122,6 +122,9 @@ const ALLIANCE_BASE_URL = process.env.ALLIANCE_BASE_URL || "https://esiparisv2.a
 const ALLIANCE_PHARMACY_CODE = process.env.ALLIANCE_PHARMACY_CODE;
 const ALLIANCE_USERNAME = process.env.ALLIANCE_USERNAME;
 const ALLIANCE_PASSWORD = process.env.ALLIANCE_PASSWORD;
+const SANCAK_BASE_URL = process.env.SANCAK_BASE_URL || "https://eticaret.sancakecza.com.tr/";
+const SANCAK_USERNAME = process.env.SANCAK_USERNAME;
+const SANCAK_PASSWORD = process.env.SANCAK_PASSWORD;
 
 function parseTurkishMoney(value) {
   const match = String(value || "").match(/([\d.]+,\d{2})/);
@@ -760,18 +763,18 @@ async function readAllianceProduct(page, requestedBarcode) {
     productName = breadcrumbMatch?.[1]?.trim() || "";
   }
 
-  // Alliance ürün sayfasında görünen "Vergi Hariç Depocu Satış Fiyatı".
-  let depotPrice = null;
-  const priceLabel = page.getByText(/Vergi Hariç Depocu Satış Fiyatı/i).first();
-  if (await priceLabel.count()) {
-    const containerText = await priceLabel.locator("xpath=..").innerText().catch(() => "");
-    depotPrice = parseTurkishMoney(containerText);
-  }
+  // Alliance fiyat alanları birbirinden ayrıdır.
+  let psf = null;
+  const psfMatch = compact.match(/Tavsiye\s*Edilen\s*Perakende\s*Satış\s*Fiyatı\s*([\d.]+,\d{2})/i);
+  psf = psfMatch ? parseTurkishMoney(psfMatch[1]) : null;
 
-  if (depotPrice === null) {
-    const priceMatch = compact.match(/Vergi\s*Hariç\s*Depocu\s*Satış\s*Fiyatı\s*([\d.]+,\d{2})/i);
-    depotPrice = priceMatch ? parseTurkishMoney(priceMatch[1]) : null;
-  }
+  let depotPrice = null;
+  const depotVatMatch = compact.match(/Vergi\s*Dahil\s*Depocu\s*Satış\s*Fiyatı\s*([\d.]+,\d{2})/i);
+  depotPrice = depotVatMatch ? parseTurkishMoney(depotVatMatch[1]) : null;
+
+  let depotPriceExVat = null;
+  const depotExVatMatch = compact.match(/Vergi\s*Hariç\s*Depocu\s*Satış\s*Fiyatı\s*([\d.]+,\d{2})/i);
+  depotPriceExVat = depotExVatMatch ? parseTurkishMoney(depotExVatMatch[1]) : null;
 
   // Sipariş hesap tablosundaki net fiyat.
   let netPrice = null;
@@ -802,8 +805,9 @@ async function readAllianceProduct(page, requestedBarcode) {
     requestedBarcode,
     barcode: requestedBarcode,
     productName,
-    psf: null,
+    psf,
     depotPrice,
+    depotPriceExVat,
     netPrice,
     inStock: available ? true : unavailable ? false : null,
     stockText: available ? "Stokta" : unavailable ? "Stokta yok" : "Belirsiz",
@@ -852,6 +856,132 @@ async function checkAllianceBarcode(barcode, existingContext = null) {
       await context?.close().catch(() => {});
       await browser?.close().catch(() => {});
     }
+  }
+}
+
+
+/* -------------------------------
+   SANCAK ECZA DEPOSU TARAYICI OTOMASYONU
+   Salt okunur: barkod, ürün adı, PSF, depocu fiyatı, net fiyat ve stok.
+-------------------------------- */
+
+async function findSancakSearchInput(page) {
+  const selectors = [
+    '#search',
+    'input[name="search"]',
+    'input[placeholder*="Ürün adı"]',
+    'input[placeholder*="barkod"]'
+  ];
+  for (const selector of selectors) {
+    const locator = page.locator(selector).first();
+    if (await locator.count()) {
+      try { if (await locator.isVisible()) return locator; } catch {}
+    }
+  }
+  throw new Error("Sancak ürün arama kutusu bulunamadı.");
+}
+
+async function loginSancak(page) {
+  if (!SANCAK_USERNAME || !SANCAK_PASSWORD) {
+    throw new Error("SANCAK_USERNAME ve SANCAK_PASSWORD Render Environment içinde tanımlı değil.");
+  }
+
+  await page.goto(SANCAK_BASE_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
+
+  const username = page.locator('#Customer_username').first();
+  if (await username.count()) {
+    await username.fill(String(SANCAK_USERNAME));
+    await page.locator('#Customer_password').first().fill(String(SANCAK_PASSWORD));
+    await page.locator('button.Customer_login__button, button.login_submit').first().click();
+    await page.waitForLoadState("domcontentloaded", { timeout: 60000 }).catch(() => {});
+  }
+
+  const startedAt = Date.now();
+  let lastError = null;
+  while (Date.now() - startedAt < 60000) {
+    try { return await findSancakSearchInput(page); }
+    catch (error) { lastError = error; await page.waitForTimeout(1200); }
+  }
+  throw lastError || new Error("Sancak girişinden sonra ürün arama ekranı açılmadı.");
+}
+
+async function readSancakProduct(page, requestedBarcode) {
+  const deadline = Date.now() + 60000;
+  let bodyText = "";
+  while (Date.now() < deadline) {
+    bodyText = await page.locator('body').innerText({ timeout: 5000 }).catch(() => "");
+    const compact = String(bodyText || "").replace(/\s+/g, " ");
+    if (compact.replace(/\D/g, "").includes(requestedBarcode) && /Perakende Fiyat|Önerilen PSF|Depocu Fiyatı/i.test(compact)) break;
+    await page.waitForTimeout(1000);
+  }
+
+  const compact = String(bodyText || "").replace(/\s+/g, " ").trim();
+  if (!compact.replace(/\D/g, "").includes(requestedBarcode)) {
+    throw new Error("Sancak ürün bulunamadı veya ürün sayfası açılamadı.");
+  }
+
+  let productName = "";
+  const barcodeNode = page.locator('.product-general-info .urun-kodu').filter({ hasText: requestedBarcode }).first();
+  if (await barcodeNode.count()) {
+    const detailRoot = barcodeNode.locator('xpath=ancestor::div[contains(@class,"siparis-detay-bilgiler")][1]');
+    productName = await detailRoot.locator('h2').first().innerText().catch(() => "");
+  }
+  if (!productName) {
+    productName = await page.locator('h2').filter({ hasText: /./ }).first().innerText().catch(() => "");
+  }
+
+  const psfMatch = compact.match(/(?:Perakende Fiyat(?:ı)?|Önerilen PSF)\s*:?[\s]*([\d.]+,\d{2})\s*₺?/i);
+  const depotMatch = compact.match(/Depocu Fiyatı\s*:?[\s]*([\d.]+,\d{2})\s*₺?/i);
+
+  let netPrice = null;
+  const netLocator = page.locator('.afternetprice').first();
+  if (await netLocator.count()) netPrice = parseTurkishMoney(await netLocator.innerText().catch(() => ""));
+  if (netPrice === null) {
+    const netMatch = compact.match(/KDV\s*Dahil\s*Birim\s*Fiyatı\s*([\d.]+,\d{2})/i);
+    netPrice = netMatch ? parseTurkishMoney(netMatch[1]) : null;
+  }
+
+  const unavailable = /Stokta Yok/i.test(compact);
+  const available = !unavailable && /\bStokta\b/i.test(compact);
+  const idMatch = compact.match(/\bID\s*(\d+)/i);
+  const expiryMatch = compact.match(/Miad\s*(\d{2}\.\d{4})/i);
+
+  return {
+    depot: "Sancak Ecza Deposu",
+    requestedBarcode,
+    barcode: requestedBarcode,
+    productName: String(productName || "").trim(),
+    psf: psfMatch ? parseTurkishMoney(psfMatch[1]) : null,
+    depotPrice: depotMatch ? parseTurkishMoney(depotMatch[1]) : null,
+    netPrice,
+    inStock: available ? true : unavailable ? false : null,
+    stockText: available ? "Stokta" : unavailable ? "Stokta yok" : "Belirsiz",
+    sancakProductId: idMatch ? idMatch[1] : null,
+    expiry: expiryMatch ? expiryMatch[1] : null,
+    checkedAt: new Date().toISOString(),
+    url: page.url()
+  };
+}
+
+async function checkSancakBarcode(barcode, existingContext = null) {
+  const cleanBarcode = String(barcode || "").replace(/\D/g, "");
+  if (cleanBarcode.length < 8 || cleanBarcode.length > 14) throw new Error("Geçerli bir barkod girin (8-14 rakam).");
+
+  let browser; let context = existingContext; let ownsContext = false;
+  try {
+    if (!context) {
+      browser = await chromium.launch({ headless: true, args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"] });
+      context = await browser.newContext({ locale: "tr-TR", timezoneId: "Europe/Istanbul", viewport: { width: 1440, height: 1000 } });
+      ownsContext = true;
+    }
+    const page = context.pages()[0] || await context.newPage();
+    const searchInput = await loginSancak(page);
+    await searchInput.fill(cleanBarcode);
+    await searchInput.press("Enter");
+    await page.waitForTimeout(1500);
+    return await readSancakProduct(page, cleanBarcode);
+  } finally {
+    if (ownsContext) { await context?.close().catch(() => {}); await browser?.close().catch(() => {}); }
   }
 }
 
@@ -2086,6 +2216,36 @@ app.post("/api/depot/alliance/check-batch", checkAdminPassword, async (req, res)
   }
 
   return res.json({ ok: true, count: results.length, results });
+});
+
+
+/* -------------------------------
+   SANCAK VE TÜM DEPOLAR ENDPOINTLERİ
+-------------------------------- */
+app.get("/api/depot/sancak/status", checkAdminPassword, (req, res) => {
+  res.json({ ok: true, depot: "Sancak Ecza Deposu", configured: Boolean(SANCAK_USERNAME && SANCAK_PASSWORD), baseUrl: SANCAK_BASE_URL, mode: "read-only" });
+});
+
+app.post("/api/depot/sancak/check", checkAdminPassword, async (req, res) => {
+  try { return res.json({ ok: true, result: await checkSancakBarcode(req.body?.barcode) }); }
+  catch (error) { console.error("SANCAK CHECK ERROR:", error); return res.status(500).json({ error: error?.message || "Sancak barkod kontrolü yapılamadı." }); }
+});
+
+app.post("/api/depot/all/check", checkAdminPassword, async (req, res) => {
+  const barcode = String(req.body?.barcode || "").replace(/\D/g, "");
+  if (barcode.length < 8 || barcode.length > 14) return res.status(400).json({ error: "Geçerli bir barkod girin." });
+  const checks = [
+    ["BEK", checkBekBarcode],
+    ["İSKOOP", checkIskoopBarcode],
+    ["Alliance Healthcare", checkAllianceBarcode],
+    ["Sancak Ecza Deposu", checkSancakBarcode]
+  ];
+  const results = [];
+  for (const [depot, fn] of checks) {
+    try { results.push({ ok: true, result: await fn(barcode) }); }
+    catch (error) { results.push({ ok: false, depot, error: error?.message || "Kontrol edilemedi." }); }
+  }
+  return res.json({ ok: true, barcode, results, checkedAt: new Date().toISOString() });
 });
 
 
