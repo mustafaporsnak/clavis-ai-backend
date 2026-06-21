@@ -2344,6 +2344,8 @@ app.get("/", (req, res) => {
     costSheet: "/api/cost-sheet",
     updateVariant: "/api/update-variant-basic",
     updateInventoryItem: "/api/update-inventory-item",
+    shopifyLocations: "/api/shopify-locations",
+    updateInventoryQuantity: "/api/update-inventory-quantity",
     updateProductStatus: "/api/update-product-status",
     bulkProductAction: "/api/bulk-product-action",
     orderWebhook: "/api/shopify-order-webhook"
@@ -2722,6 +2724,133 @@ app.post("/api/update-inventory-item", checkAdminPassword, async (req, res) => {
     console.error("UPDATE INVENTORY ITEM ERROR:", error);
     return res.status(500).json({
       error: error.message || "Inventory item güncellenemedi."
+    });
+  }
+});
+
+
+app.get("/api/shopify-locations", checkAdminPassword, async (req, res) => {
+  try {
+    const data = await shopifyGraphQL(`
+      query {
+        locations(first: 50) {
+          edges {
+            node {
+              id
+              name
+              isActive
+              fulfillsOnlineOrders
+            }
+          }
+        }
+      }
+    `);
+
+    const locations = (data.locations?.edges || [])
+      .map((edge) => edge.node)
+      .filter((location) => location?.isActive);
+
+    return res.json({
+      status: "ok",
+      count: locations.length,
+      locations
+    });
+  } catch (error) {
+    console.error("SHOPIFY LOCATIONS ERROR:", error);
+    return res.status(500).json({
+      error: error.message || "Shopify konumları alınamadı."
+    });
+  }
+});
+
+app.post("/api/update-inventory-quantity", checkAdminPassword, async (req, res) => {
+  try {
+    const { inventoryItemId, locationId, quantity, compareQuantity } = req.body || {};
+
+    if (!inventoryItemId) {
+      return res.status(400).json({ error: "inventoryItemId eksik." });
+    }
+
+    if (!locationId) {
+      return res.status(400).json({ error: "locationId eksik." });
+    }
+
+    const numericQuantity = Number(quantity);
+    if (!Number.isInteger(numericQuantity) || numericQuantity < 0) {
+      return res.status(400).json({
+        error: "quantity sıfır veya pozitif tam sayı olmalı."
+      });
+    }
+
+    const quantityInput = {
+      inventoryItemId,
+      locationId,
+      quantity: numericQuantity
+    };
+
+    if (compareQuantity !== undefined && compareQuantity !== null && compareQuantity !== "") {
+      const numericCompareQuantity = Number(compareQuantity);
+      if (!Number.isInteger(numericCompareQuantity) || numericCompareQuantity < 0) {
+        return res.status(400).json({
+          error: "compareQuantity sıfır veya pozitif tam sayı olmalı."
+        });
+      }
+      quantityInput.compareQuantity = numericCompareQuantity;
+    }
+
+    const input = {
+      name: "available",
+      reason: "correction",
+      ignoreCompareQuantity: quantityInput.compareQuantity === undefined,
+      referenceDocumentUri: `clavis://inventory-correction/${Date.now()}`,
+      quantities: [quantityInput]
+    };
+
+    const data = await shopifyGraphQL(
+      `
+      mutation inventorySetQuantities($input: InventorySetQuantitiesInput!) {
+        inventorySetQuantities(input: $input) {
+          inventoryAdjustmentGroup {
+            createdAt
+            reason
+            referenceDocumentUri
+            changes {
+              name
+              delta
+              quantityAfterChange
+            }
+          }
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+      `,
+      { input }
+    );
+
+    const payload = data.inventorySetQuantities;
+    const errors = payload?.userErrors || [];
+
+    if (errors.length) {
+      return res.status(400).json({
+        error: errors.map((e) => e.message).join(", "),
+        userErrors: errors
+      });
+    }
+
+    return res.json({
+      status: "ok",
+      inventoryItemId,
+      locationId,
+      quantity: numericQuantity,
+      adjustment: payload?.inventoryAdjustmentGroup || null
+    });
+  } catch (error) {
+    console.error("UPDATE INVENTORY QUANTITY ERROR:", error);
+    return res.status(500).json({
+      error: error.message || "Stok miktarı güncellenemedi."
     });
   }
 });
