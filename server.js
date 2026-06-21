@@ -2556,19 +2556,54 @@ app.post("/api/depot/sancak/check", checkAdminPassword, async (req, res) => {
 
 app.post("/api/depot/all/check", checkAdminPassword, async (req, res) => {
   const barcode = String(req.body?.barcode || "").replace(/\D/g, "");
-  if (barcode.length < 8 || barcode.length > 14) return res.status(400).json({ error: "Geçerli bir barkod girin." });
+  if (barcode.length < 8 || barcode.length > 14) {
+    return res.status(400).json({ error: "Geçerli bir barkod girin." });
+  }
+
   const checks = [
     ["BEK", checkBekBarcode],
     ["İSKOOP", checkIskoopBarcode],
     ["Alliance Healthcare", checkAllianceBarcode],
     ["Sancak Ecza Deposu", checkSancakBarcode]
   ];
-  const results = [];
-  for (const [depot, fn] of checks) {
-    try { results.push({ ok: true, result: await fn(barcode) }); }
-    catch (error) { results.push({ ok: false, depot, error: error?.message || "Kontrol edilemedi." }); }
-  }
-  return res.json({ ok: true, barcode, results, checkedAt: new Date().toISOString() });
+
+  const startedAt = Date.now();
+  const settled = await Promise.allSettled(
+    checks.map(async ([depot, fn]) => {
+      const result = await fn(barcode);
+      return { depot, result };
+    })
+  );
+
+  const results = settled.map((entry, index) => {
+    const depot = checks[index][0];
+    if (entry.status === "fulfilled") {
+      return { ok: true, depot, result: entry.value.result };
+    }
+    return {
+      ok: false,
+      depot,
+      error: entry.reason?.message || "Kontrol edilemedi."
+    };
+  });
+
+  const successfulResults = results.filter((item) => item.ok);
+  const allSuccessful = successfulResults.length === checks.length;
+  const anyInStock = successfulResults.some((item) => item.result?.inStock === true);
+  const allOutOfStock = allSuccessful && successfulResults.every((item) => item.result?.inStock === false);
+
+  return res.json({
+    ok: true,
+    barcode,
+    mode: "parallel",
+    durationMs: Date.now() - startedAt,
+    allSuccessful,
+    anyInStock,
+    allOutOfStock,
+    stockDecision: anyInStock ? "available" : allOutOfStock ? "out_of_stock" : "uncertain",
+    results,
+    checkedAt: new Date().toISOString()
+  });
 });
 
 
