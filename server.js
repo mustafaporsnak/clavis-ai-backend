@@ -130,8 +130,9 @@ const TEBRP_LOGIN_URL = process.env.TEBRP_LOGIN_URL || `${TEBRP_BASE_URL}login/l
 const TEBRP_SEARCH_URL = process.env.TEBRP_SEARCH_URL || `${TEBRP_BASE_URL}uygulama?operation=alt_giris`;
 const TEBRP_USERNAME = process.env.TEBRP_USERNAME;
 const TEBRP_PASSWORD = process.env.TEBRP_PASSWORD;
-const ILACFIYATI_BASE_URL = String(process.env.ILACFIYATI_BASE_URL || "https://ilacfiyati.com/").replace(/\/+$/, "") + "/";
-const ILACFIYATI_SEARCH_URL = process.env.ILACFIYATI_SEARCH_URL || `${ILACFIYATI_BASE_URL}tum-urunler`;
+const TEBRP_CONNECTOR_TOKEN = String(process.env.TEBRP_CONNECTOR_TOKEN || "").trim();
+const TEBRP_CONNECTOR_ONLINE_MS = Number(process.env.TEBRP_CONNECTOR_ONLINE_MS || 45000);
+const TEBRP_CONNECTOR_JOB_TIMEOUT_MS = Number(process.env.TEBRP_CONNECTOR_JOB_TIMEOUT_MS || 120000);
 
 
 /* -------------------------------
@@ -2110,319 +2111,6 @@ async function matchProductsFromShopify(answerText) {
 }
 
 
-
-/* -------------------------------
-   ILACFIYATI.COM PSF TARAYICI OTOMASYONU
-   Giriş gerektirmez; barkodla ürün adı ve perakende satış fiyatını okur.
--------------------------------- */
-
-async function findIlacFiyatiSearchInput(page) {
-  const selectors = [
-    'input[placeholder*="İlaç adı"]',
-    'input[placeholder*="ilaç adı"]',
-    'input[placeholder*="barkod ara"]',
-    'input[placeholder*="Barkod No"]',
-    'input[placeholder*="Müstahzar Adı"]',
-    'input[placeholder*="Kelime Yazınız"]',
-    'input[name="q"]',
-    'input[type="search"]'
-  ];
-
-  for (const selector of selectors) {
-    const all = page.locator(selector);
-    const count = await all.count().catch(() => 0);
-    for (let i = 0; i < count; i += 1) {
-      const locator = all.nth(i);
-      if (await locator.isVisible().catch(() => false)) return locator;
-    }
-  }
-
-  const textInputs = page.locator('input[type="text"]');
-  const count = await textInputs.count().catch(() => 0);
-  for (let i = 0; i < count; i += 1) {
-    const locator = textInputs.nth(i);
-    if (await locator.isVisible().catch(() => false)) return locator;
-  }
-
-  throw new Error("İlaçFiyatı.com arama kutusu bulunamadı.");
-}
-
-async function openIlacFiyati(page) {
-  await page.goto(ILACFIYATI_BASE_URL, { waitUntil: "domcontentloaded", timeout: 45000 });
-  await page.waitForTimeout(500);
-  return findIlacFiyatiSearchInput(page);
-}
-
-async function testIlacFiyatiConnection() {
-  const session = await getDepotSession("ilacfiyati", openIlacFiyati);
-  const page = session.page;
-  session.lastUsedAt = Date.now();
-  const input = await findIlacFiyatiSearchInput(page);
-  if (!(await input.isVisible().catch(() => false))) {
-    await closeDepotSession("ilacfiyati");
-    throw new Error("İlaçFiyatı.com arama ekranı açılamadı.");
-  }
-  return {
-    ok: true,
-    source: "İlaçFiyatı.com",
-    currentUrl: page.url(),
-    baseUrl: ILACFIYATI_BASE_URL,
-    checkedAt: new Date().toISOString()
-  };
-}
-
-async function findIlacFiyatiDetailUrl(page, requestedBarcode) {
-  const cleanBarcode = String(requestedBarcode || "").replace(/\D/g, "");
-  const currentUrl = page.url();
-  if (/\/(?:ilaclar|takviye-edici-gida|kozmetik)\//i.test(currentUrl)) return currentUrl;
-
-  const candidate = await page.evaluate((barcode) => {
-    const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
-    const allowed = /\/(?:ilaclar|takviye-edici-gida|kozmetik)\//i;
-    const anchors = Array.from(document.querySelectorAll('a[href]'));
-    const matches = [];
-
-    for (const anchor of anchors) {
-      const href = anchor.href || "";
-      if (!allowed.test(href)) continue;
-      let node = anchor;
-      let text = clean(anchor.textContent);
-      for (let i = 0; i < 5 && node?.parentElement; i += 1) {
-        node = node.parentElement;
-        const candidateText = clean(node.textContent);
-        if (candidateText.replace(/\D/g, "").includes(barcode)) {
-          text = candidateText;
-          break;
-        }
-      }
-      if (text.replace(/\D/g, "").includes(barcode)) {
-        matches.push({ href, text, label: clean(anchor.textContent) });
-      }
-    }
-
-    matches.sort((a, b) => a.text.length - b.text.length);
-    return matches[0] || null;
-  }, cleanBarcode).catch(() => null);
-
-  return candidate?.href || null;
-}
-
-async function readIlacFiyatiProduct(page, requestedBarcode) {
-  const cleanRequested = String(requestedBarcode || "").replace(/\D/g, "");
-  await page.locator("body").waitFor({ state: "visible", timeout: 30000 });
-
-  const raw = await page.evaluate((barcode) => {
-    const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
-    const isDetail = /\/(?:ilaclar|takviye-edici-gida|kozmetik)\//i.test(location.pathname);
-    let scope = document.body;
-
-    if (!isDetail) {
-      const candidates = Array.from(document.querySelectorAll("article,li,section,div"))
-        .map((el) => ({ el, text: clean(el.innerText || el.textContent) }))
-        .filter((item) =>
-          item.text.replace(/\D/g, "").includes(barcode) &&
-          /PERAKENDE\s+SATIŞ\s+FİYATI|İLAÇ\s+FİYATI/i.test(item.text)
-        )
-        .sort((a, b) => a.text.length - b.text.length);
-      if (candidates[0]?.el) scope = candidates[0].el;
-    }
-
-    const scopeText = clean(scope?.innerText || scope?.textContent || "");
-    const headings = Array.from(scope?.querySelectorAll?.("h1,h2,h3,a") || [])
-      .map((el) => clean(el.textContent))
-      .filter((value) =>
-        value &&
-        value.length > 5 &&
-        !/Detaylı Arama|İlaç Katılım|Türkiye İlaç Fiyatları|Hemen Ara|Devamını Göster/i.test(value)
-      );
-
-    let productName = headings[0] || "";
-    const barcodeMatch = scopeText.match(new RegExp("BARKOD\\s*[:|]?\\s*(" + barcode + ")", "i"));
-    const exactBarcode = barcodeMatch?.[1] || (scopeText.replace(/\D/g, "").includes(barcode) ? barcode : "");
-
-    const pricePatterns = [
-      /PERAKENDE\s+SATIŞ\s+FİYATI\s*[:|]?\s*(?:₺|TL)?\s*([\d.]+,\d{2})\s*(?:TL)?/i,
-      /İLAÇ\s+FİYATI\s*[:|]?\s*(?:₺|TL)?\s*([\d.]+,\d{2})\s*(?:TL)?/i,
-      /Perakende\s+Satış\s+Fiyatı\s*₺?\s*([\d.]+,\d{2})/i
-    ];
-    let psfText = "";
-    for (const pattern of pricePatterns) {
-      const match = scopeText.match(pattern);
-      if (match?.[1]) { psfText = match[1]; break; }
-    }
-
-    const statusMatch = scopeText.match(/(?:İLAÇ\s+)?DURUMU\s*[:|]?\s*(AKTİF|PASİF)/i);
-    const futurePriceMatch = scopeText.match(/fiyatı\s+([0-3]?\d\.[01]?\d\.\d{4}|[0-3]?\d\/[01]?\d\/\d{4})\s+tarihinde/i);
-
-    if (!productName) {
-      const beforeBarcode = scopeText.split(/BARKOD/i)[0];
-      const parts = beforeBarcode.split(/\s{2,}|\n/).map(clean).filter(Boolean);
-      productName = parts.reverse().find((x) => x.length > 8) || "";
-    }
-
-    return {
-      productName,
-      barcode: exactBarcode,
-      psfText,
-      status: statusMatch?.[1]?.toUpperCase() || "",
-      priceDate: futurePriceMatch?.[1] || "",
-      preview: scopeText.slice(0, 3000)
-    };
-  }, cleanRequested);
-
-  if (!raw.barcode) throw new Error("İlaçFiyatı.com sonucunda barkod okunamadı.");
-  if (raw.barcode !== cleanRequested) {
-    throw new Error(`İlaçFiyatı.com barkod eşleşmedi. Aranan: ${cleanRequested}, bulunan: ${raw.barcode}`);
-  }
-
-  const psf = parseTurkishMoney(raw.psfText);
-  if (psf === null || psf <= 0) {
-    throw new Error("İlaçFiyatı.com sonucunda Perakende Satış Fiyatı okunamadı veya ürün fiyatı 0.");
-  }
-
-  return {
-    source: "İlaçFiyatı.com",
-    requestedBarcode: cleanRequested,
-    barcode: raw.barcode,
-    productName: raw.productName || null,
-    psf,
-    psfText: raw.psfText || null,
-    status: raw.status || null,
-    priceDate: raw.priceDate || null,
-    detailUrl: page.url(),
-    checkedAt: new Date().toISOString()
-  };
-}
-
-async function checkIlacFiyatiBarcode(barcode) {
-  const cleanBarcode = String(barcode || "").replace(/\D/g, "");
-  if (cleanBarcode.length < 8 || cleanBarcode.length > 14) {
-    throw new Error("Geçerli bir barkod girin (8-14 rakam).");
-  }
-
-  const cached = getCachedDepotResult("ilacfiyati", cleanBarcode);
-  if (cached) return cached;
-
-  return withDepotLock("ilacfiyati", async () => {
-    const cachedAfterWait = getCachedDepotResult("ilacfiyati", cleanBarcode);
-    if (cachedAfterWait) return cachedAfterWait;
-
-    let lastError;
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      try {
-        const session = await getDepotSession("ilacfiyati", openIlacFiyati);
-        const page = session.page;
-        session.lastUsedAt = Date.now();
-
-        const directSearchUrl = `${ILACFIYATI_SEARCH_URL}?q=${encodeURIComponent(cleanBarcode)}`;
-        await page.goto(directSearchUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
-        await page.waitForTimeout(700);
-
-        let bodyHasBarcode = await page.evaluate(
-          (value) => String(document.body?.innerText || "").replace(/\D/g, "").includes(value),
-          cleanBarcode
-        ).catch(() => false);
-
-        if (!bodyHasBarcode) {
-          const input = await openIlacFiyati(page);
-          await input.fill("");
-          await input.fill(cleanBarcode);
-          await input.press("Enter");
-          await page.waitForTimeout(1000);
-          bodyHasBarcode = await page.waitForFunction(
-            (value) => String(document.body?.innerText || "").replace(/\D/g, "").includes(value),
-            cleanBarcode,
-            { timeout: 20000 }
-          ).then(() => true).catch(() => false);
-        }
-
-        if (!bodyHasBarcode) {
-          throw new Error("İlaçFiyatı.com aramasında barkod bulunamadı.");
-        }
-
-        const detailUrl = await findIlacFiyatiDetailUrl(page, cleanBarcode);
-        if (detailUrl && detailUrl !== page.url()) {
-          await page.goto(detailUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
-          await page.waitForTimeout(400);
-        }
-
-        const result = await readIlacFiyatiProduct(page, cleanBarcode);
-        setCachedDepotResult("ilacfiyati", cleanBarcode, result);
-        return result;
-      } catch (error) {
-        lastError = error;
-        await closeDepotSession("ilacfiyati");
-      }
-    }
-
-    throw lastError || new Error("İlaçFiyatı.com barkod sorgusu yapılamadı.");
-  });
-}
-
-/* -------------------------------
-   ILACFIYATI.COM PSF KONTROL ENDPOINTLERİ
--------------------------------- */
-
-app.get("/api/ilacfiyati/status", checkAdminPassword, (req, res) => {
-  return res.json({
-    ok: true,
-    source: "İlaçFiyatı.com",
-    configured: true,
-    baseUrl: ILACFIYATI_BASE_URL,
-    mode: "read-only"
-  });
-});
-
-app.post("/api/ilacfiyati/test", checkAdminPassword, async (req, res) => {
-  try {
-    return res.json(await testIlacFiyatiConnection());
-  } catch (error) {
-    console.error("ILACFIYATI TEST ERROR:", error);
-    return res.status(500).json({
-      error: error?.message || "İlaçFiyatı.com bağlantı testi başarısız."
-    });
-  }
-});
-
-app.post("/api/ilacfiyati/check", checkAdminPassword, async (req, res) => {
-  try {
-    const result = await checkIlacFiyatiBarcode(req.body?.barcode);
-    return res.json({ ok: true, result });
-  } catch (error) {
-    console.error("ILACFIYATI CHECK ERROR:", error);
-    return res.status(500).json({
-      error: error?.message || "İlaçFiyatı.com barkod kontrolü yapılamadı."
-    });
-  }
-});
-
-app.post("/api/ilacfiyati/check-batch", checkAdminPassword, async (req, res) => {
-  const barcodes = Array.from(new Set(
-    (Array.isArray(req.body?.barcodes) ? req.body.barcodes : [])
-      .map((value) => String(value || "").replace(/\D/g, ""))
-      .filter((value) => value.length >= 8 && value.length <= 14)
-  )).slice(0, 20);
-
-  if (!barcodes.length) {
-    return res.status(400).json({ error: "Kontrol edilecek barkod bulunamadı." });
-  }
-
-  const results = [];
-  for (const barcode of barcodes) {
-    try {
-      results.push({ ok: true, result: await checkIlacFiyatiBarcode(barcode) });
-    } catch (error) {
-      results.push({
-        ok: false,
-        requestedBarcode: barcode,
-        error: error?.message || "Kontrol edilemedi."
-      });
-    }
-  }
-
-  return res.json({ ok: true, count: results.length, results });
-});
-
 /* -------------------------------
    TEBRP PSF TARAYICI OTOMASYONU
    Barkodla ürün detayına gider; ürün adı, barkod ve PSF okur.
@@ -2622,6 +2310,191 @@ async function checkTebrpBarcode(barcode) {
 
 
 
+
+/* -------------------------------
+   TEBRP YEREL CONNECTOR KÖPRÜSÜ
+   Eczane bilgisayarı yalnızca dışarı doğru HTTPS bağlantısı kurar.
+-------------------------------- */
+
+const tebrpConnectorState = {
+  lastSeenAt: 0,
+  connectorId: null,
+  version: null,
+  busy: false,
+  machineName: null,
+  lastError: null
+};
+
+const tebrpConnectorQueue = [];
+const tebrpConnectorJobs = new Map();
+
+function safeTokenEqual(received, expected) {
+  const a = Buffer.from(String(received || ""));
+  const b = Buffer.from(String(expected || ""));
+  if (!a.length || a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+function checkTebrpConnectorToken(req, res, next) {
+  if (!TEBRP_CONNECTOR_TOKEN) {
+    return res.status(503).json({ error: "TEBRP_CONNECTOR_TOKEN sunucuda tanımlı değil." });
+  }
+
+  const token = String(req.headers["x-tebrp-connector-token"] || "").trim();
+  if (!safeTokenEqual(token, TEBRP_CONNECTOR_TOKEN)) {
+    return res.status(401).json({ error: "Connector yetkilendirmesi başarısız." });
+  }
+  return next();
+}
+
+function isTebrpConnectorOnline() {
+  return Boolean(
+    TEBRP_CONNECTOR_TOKEN &&
+    tebrpConnectorState.lastSeenAt &&
+    Date.now() - tebrpConnectorState.lastSeenAt <= TEBRP_CONNECTOR_ONLINE_MS
+  );
+}
+
+function updateTebrpConnectorState(body = {}) {
+  tebrpConnectorState.lastSeenAt = Date.now();
+  tebrpConnectorState.connectorId = String(body.connectorId || tebrpConnectorState.connectorId || "").slice(0, 100) || null;
+  tebrpConnectorState.version = String(body.version || tebrpConnectorState.version || "").slice(0, 50) || null;
+  tebrpConnectorState.machineName = String(body.machineName || tebrpConnectorState.machineName || "").slice(0, 100) || null;
+  if (typeof body.busy === "boolean") tebrpConnectorState.busy = body.busy;
+  if (body.lastError !== undefined) tebrpConnectorState.lastError = body.lastError ? String(body.lastError).slice(0, 500) : null;
+}
+
+function createTebrpConnectorJob(type, payload = {}, timeoutMs = TEBRP_CONNECTOR_JOB_TIMEOUT_MS) {
+  if (!TEBRP_CONNECTOR_TOKEN) {
+    return Promise.reject(new Error("TEBRP Connector sunucu anahtarı tanımlı değil."));
+  }
+  if (!isTebrpConnectorOnline()) {
+    return Promise.reject(new Error("TEBRP Connector çevrimdışı. Eczane bilgisayarının açık ve connector uygulamasının çalışır olduğundan emin olun."));
+  }
+
+  const id = crypto.randomUUID();
+  const createdAt = Date.now();
+
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      const job = tebrpConnectorJobs.get(id);
+      if (job) {
+        tebrpConnectorJobs.delete(id);
+        const index = tebrpConnectorQueue.findIndex((item) => item.id === id);
+        if (index >= 0) tebrpConnectorQueue.splice(index, 1);
+      }
+      reject(new Error("TEBRP Connector yanıt süresi doldu."));
+    }, Math.max(10000, Number(timeoutMs) || TEBRP_CONNECTOR_JOB_TIMEOUT_MS));
+
+    const job = {
+      id,
+      type,
+      payload,
+      createdAt,
+      assignedAt: null,
+      connectorId: null,
+      resolve,
+      reject,
+      timer
+    };
+
+    tebrpConnectorJobs.set(id, job);
+    tebrpConnectorQueue.push(job);
+  });
+}
+
+async function testTebrpViaBestRoute() {
+  if (TEBRP_CONNECTOR_TOKEN) {
+    return createTebrpConnectorJob("test", {});
+  }
+  return testTebrpConnection();
+}
+
+async function checkTebrpViaBestRoute(barcode) {
+  const cleanBarcode = String(barcode || "").replace(/\D/g, "");
+  if (cleanBarcode.length < 8 || cleanBarcode.length > 14) {
+    throw new Error("Geçerli bir barkod girin (8-14 rakam).");
+  }
+
+  const cached = getCachedDepotResult("tebrp", cleanBarcode);
+  if (cached) return cached;
+
+  let result;
+  if (TEBRP_CONNECTOR_TOKEN) {
+    result = await createTebrpConnectorJob("check", { barcode: cleanBarcode });
+  } else {
+    result = await checkTebrpBarcode(cleanBarcode);
+  }
+
+  if (result && result.barcode === cleanBarcode) {
+    setCachedDepotResult("tebrp", cleanBarcode, result);
+  }
+  return result;
+}
+
+app.post("/api/tebrp-connector/heartbeat", checkTebrpConnectorToken, (req, res) => {
+  updateTebrpConnectorState(req.body || {});
+  return res.json({
+    ok: true,
+    serverTime: new Date().toISOString(),
+    online: true,
+    queuedJobs: tebrpConnectorQueue.length
+  });
+});
+
+app.get("/api/tebrp-connector/jobs/next", checkTebrpConnectorToken, (req, res) => {
+  updateTebrpConnectorState({
+    connectorId: req.query?.connectorId,
+    version: req.query?.version,
+    machineName: req.query?.machineName,
+    busy: false
+  });
+
+  const now = Date.now();
+  while (tebrpConnectorQueue.length) {
+    const job = tebrpConnectorQueue.shift();
+    if (!job || !tebrpConnectorJobs.has(job.id)) continue;
+    if (now - job.createdAt > TEBRP_CONNECTOR_JOB_TIMEOUT_MS) continue;
+
+    job.assignedAt = now;
+    job.connectorId = String(req.query?.connectorId || "").slice(0, 100) || null;
+    tebrpConnectorState.busy = true;
+
+    return res.json({
+      ok: true,
+      job: {
+        id: job.id,
+        type: job.type,
+        payload: job.payload,
+        createdAt: new Date(job.createdAt).toISOString()
+      }
+    });
+  }
+
+  return res.status(204).end();
+});
+
+app.post("/api/tebrp-connector/jobs/:id/result", checkTebrpConnectorToken, (req, res) => {
+  updateTebrpConnectorState({ ...(req.body?.connector || {}), busy: false, lastError: req.body?.ok === false ? req.body?.error : null });
+
+  const id = String(req.params.id || "");
+  const job = tebrpConnectorJobs.get(id);
+  if (!job) {
+    return res.status(404).json({ error: "İş bulunamadı veya süresi doldu." });
+  }
+
+  clearTimeout(job.timer);
+  tebrpConnectorJobs.delete(id);
+
+  if (req.body?.ok === false) {
+    job.reject(new Error(String(req.body?.error || "TEBRP Connector işlemi başarısız.")));
+  } else {
+    job.resolve(req.body?.result ?? null);
+  }
+
+  return res.json({ ok: true });
+});
+
 /* -------------------------------
    TEBRP PSF KONTROL ENDPOINTLERİ
 -------------------------------- */
@@ -2630,15 +2503,26 @@ app.get("/api/tebrp/status", checkAdminPassword, (req, res) => {
   return res.json({
     ok: true,
     source: "TEBRP",
-    configured: Boolean(TEBRP_USERNAME && TEBRP_PASSWORD),
+    mode: TEBRP_CONNECTOR_TOKEN ? "local-connector" : "direct",
+    connectorConfigured: Boolean(TEBRP_CONNECTOR_TOKEN),
+    connectorOnline: isTebrpConnectorOnline(),
+    connector: {
+      lastSeenAt: tebrpConnectorState.lastSeenAt ? new Date(tebrpConnectorState.lastSeenAt).toISOString() : null,
+      connectorId: tebrpConnectorState.connectorId,
+      version: tebrpConnectorState.version,
+      machineName: tebrpConnectorState.machineName,
+      busy: tebrpConnectorState.busy,
+      lastError: tebrpConnectorState.lastError
+    },
+    queuedJobs: tebrpConnectorQueue.length,
     baseUrl: TEBRP_BASE_URL,
-    mode: "read-only"
+    readOnly: true
   });
 });
 
 app.post("/api/tebrp/test", checkAdminPassword, async (req, res) => {
   try {
-    return res.json(await testTebrpConnection());
+    return res.json(await testTebrpViaBestRoute());
   } catch (error) {
     console.error("TEBRP TEST ERROR:", error);
     return res.status(500).json({
@@ -2649,7 +2533,7 @@ app.post("/api/tebrp/test", checkAdminPassword, async (req, res) => {
 
 app.post("/api/tebrp/check", checkAdminPassword, async (req, res) => {
   try {
-    const result = await checkTebrpBarcode(req.body?.barcode);
+    const result = await checkTebrpViaBestRoute(req.body?.barcode);
     return res.json({ ok: true, result });
   } catch (error) {
     console.error("TEBRP CHECK ERROR:", error);
@@ -2664,26 +2548,34 @@ app.post("/api/tebrp/check-batch", checkAdminPassword, async (req, res) => {
     (Array.isArray(req.body?.barcodes) ? req.body.barcodes : [])
       .map((value) => String(value || "").replace(/\D/g, ""))
       .filter((value) => value.length >= 8 && value.length <= 14)
-  )).slice(0, 20);
+  )).slice(0, 50);
 
   if (!barcodes.length) {
     return res.status(400).json({ error: "Kontrol edilecek barkod bulunamadı." });
   }
 
-  const results = [];
-  for (const barcode of barcodes) {
-    try {
-      results.push({ ok: true, result: await checkTebrpBarcode(barcode) });
-    } catch (error) {
-      results.push({
-        ok: false,
-        requestedBarcode: barcode,
-        error: error?.message || "Kontrol edilemedi."
-      });
+  try {
+    if (TEBRP_CONNECTOR_TOKEN) {
+      const result = await createTebrpConnectorJob("check-batch", { barcodes }, Math.max(TEBRP_CONNECTOR_JOB_TIMEOUT_MS, barcodes.length * 45000));
+      const rows = Array.isArray(result?.results) ? result.results : [];
+      for (const row of rows) {
+        if (row?.ok && row?.result?.barcode) setCachedDepotResult("tebrp", row.result.barcode, row.result);
+      }
+      return res.json({ ok: true, count: rows.length, results: rows });
     }
-  }
 
-  return res.json({ ok: true, count: results.length, results });
+    const results = [];
+    for (const barcode of barcodes) {
+      try {
+        results.push({ ok: true, result: await checkTebrpBarcode(barcode) });
+      } catch (error) {
+        results.push({ ok: false, requestedBarcode: barcode, error: error?.message || "Kontrol edilemedi." });
+      }
+    }
+    return res.json({ ok: true, count: results.length, results });
+  } catch (error) {
+    return res.status(500).json({ error: error?.message || "TEBRP toplu kontrolü yapılamadı." });
+  }
 });
 
 /* -------------------------------
@@ -2976,10 +2868,6 @@ app.get("/", (req, res) => {
     health: "/health",
     adminLogin: "/api/admin-login",
     adminSession: "/api/admin-session",
-    ilacFiyatiStatus: "/api/ilacfiyati/status",
-    ilacFiyatiTest: "/api/ilacfiyati/test",
-    ilacFiyatiCheck: "/api/ilacfiyati/check",
-    ilacFiyatiCheckBatch: "/api/ilacfiyati/check-batch",
     tebrpStatus: "/api/tebrp/status",
     tebrpTest: "/api/tebrp/test",
     tebrpCheck: "/api/tebrp/check",
