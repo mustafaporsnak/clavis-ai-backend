@@ -2113,39 +2113,52 @@ async function matchProductsFromShopify(answerText) {
    Barkodla ürün detayına gider; ürün adı, barkod ve PSF okur.
 -------------------------------- */
 
+async function gotoTebrp(page, url, timeout = 45000) {
+  // TEBRP bazı sayfalarda DOMContentLoaded olayını çok geç tamamlıyor.
+  // İlk HTTP yanıtı gelir gelmez devam edip gerekli alanı ayrıca bekliyoruz.
+  await page.goto(url, { waitUntil: "commit", timeout });
+  await page.waitForTimeout(500);
+}
+
 async function loginTebrp(page) {
   if (!TEBRP_USERNAME || !TEBRP_PASSWORD) {
     throw new Error("TEBRP_USERNAME ve TEBRP_PASSWORD ortam değişkenleri tanımlı değil.");
   }
 
-  await page.goto(TEBRP_SEARCH_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
-
-  const searchInput = page.locator("#araInput");
-  if (await searchInput.isVisible().catch(() => false)) return searchInput;
-
-  await page.goto(TEBRP_LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
-  await page.locator("#username").waitFor({ state: "visible", timeout: 30000 });
-  await page.locator("#username").fill(String(TEBRP_USERNAME));
-  await page.locator("#password").fill(String(TEBRP_PASSWORD));
-
-  await Promise.all([
-    page.waitForLoadState("domcontentloaded", { timeout: 60000 }).catch(() => {}),
-    page.locator("#giris_butonu").click()
-  ]);
-
-  await page.waitForTimeout(1200);
+  // Mevcut oturum varsa doğrudan arama ekranı açılır; yoksa giriş sayfasına yönlenir.
+  await gotoTebrp(page, TEBRP_SEARCH_URL);
+  await page.locator("#araInput, #username").first().waitFor({ state: "visible", timeout: 30000 }).catch(() => {});
 
   if (await page.locator("#araInput").isVisible().catch(() => false)) {
     return page.locator("#araInput");
   }
 
-  await page.goto(TEBRP_SEARCH_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
+  // Yönlendirme tamamlanmadıysa giriş sayfasını doğrudan aç.
+  if (!(await page.locator("#username").isVisible().catch(() => false))) {
+    await gotoTebrp(page, TEBRP_LOGIN_URL);
+  }
+
+  await page.locator("#username").waitFor({ state: "visible", timeout: 30000 });
+  await page.locator("#password").waitFor({ state: "visible", timeout: 30000 });
+  await page.locator("#username").fill(String(TEBRP_USERNAME).trim());
+  await page.locator("#password").fill(String(TEBRP_PASSWORD));
+  await page.locator("#giris_butonu").click();
+
+  // Yükleme olayını değil, gerçek arama kutusunu bekle.
+  await page.locator("#araInput").waitFor({ state: "visible", timeout: 60000 }).catch(() => {});
+  if (await page.locator("#araInput").isVisible().catch(() => false)) {
+    return page.locator("#araInput");
+  }
+
+  // Giriş sonrası yönlendirme oluşmadıysa korumalı sayfayı yeniden aç.
+  await gotoTebrp(page, TEBRP_SEARCH_URL);
+  await page.locator("#araInput").waitFor({ state: "visible", timeout: 30000 }).catch(() => {});
   if (await page.locator("#araInput").isVisible().catch(() => false)) {
     return page.locator("#araInput");
   }
 
   const loginError = await page.locator("#sonuc_mesaj").textContent().catch(() => "");
-  throw new Error(loginError?.trim() || "TEBRP girişi yapılamadı. Kullanıcı adı, şifre veya doğrulama adımını kontrol edin.");
+  throw new Error(loginError?.trim() || `TEBRP girişi tamamlanamadı. Son adres: ${page.url()}`);
 }
 
 async function testTebrpConnection() {
@@ -2256,7 +2269,8 @@ async function checkTebrpBarcode(barcode) {
         const page = session.page;
         session.lastUsedAt = Date.now();
 
-        await page.goto(TEBRP_SEARCH_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
+        await gotoTebrp(page, TEBRP_SEARCH_URL);
+        await page.locator("#araInput").waitFor({ state: "visible", timeout: 30000 }).catch(() => {});
         if (!(await page.locator("#araInput").isVisible().catch(() => false))) {
           await closeDepotSession("tebrp");
           throw new Error("TEBRP oturumu kapandı; yeniden giriş gerekiyor.");
@@ -2268,7 +2282,10 @@ async function checkTebrpBarcode(barcode) {
 
         const previousUrl = page.url();
         await input.press("Enter");
-        await page.waitForURL((url) => url.href !== previousUrl && /operation=urun_detay/i.test(url.href), { timeout: 45000 });
+        await page.waitForURL(
+          (url) => url.href !== previousUrl && /operation=urun_detay/i.test(url.href),
+          { timeout: 45000, waitUntil: "commit" }
+        );
 
         const result = await readTebrpProduct(page, cleanBarcode);
         setCachedDepotResult("tebrp", cleanBarcode, result);
