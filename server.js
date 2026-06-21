@@ -125,7 +125,7 @@ const ALLIANCE_PASSWORD = process.env.ALLIANCE_PASSWORD;
 const SANCAK_BASE_URL = process.env.SANCAK_BASE_URL || "https://eticaret.sancakecza.com.tr/";
 const SANCAK_USERNAME = process.env.SANCAK_USERNAME;
 const SANCAK_PASSWORD = process.env.SANCAK_PASSWORD;
-const TEBRP_BASE_URL = process.env.TEBRP_BASE_URL || "https://www.tebrp.com/tebrp_plus/";
+const TEBRP_BASE_URL = String(process.env.TEBRP_BASE_URL || "https://www.tebrp.com/tebrp_plus/").replace(/\/+$/, "") + "/";
 const TEBRP_LOGIN_URL = process.env.TEBRP_LOGIN_URL || `${TEBRP_BASE_URL}login/login.jsp?from=%2Ftebrp_plus%2Fuygulama%3Foperation%3Dalt_giris`;
 const TEBRP_SEARCH_URL = process.env.TEBRP_SEARCH_URL || `${TEBRP_BASE_URL}uygulama?operation=alt_giris`;
 const TEBRP_USERNAME = process.env.TEBRP_USERNAME;
@@ -2148,6 +2148,26 @@ async function loginTebrp(page) {
   throw new Error(loginError?.trim() || "TEBRP girişi yapılamadı. Kullanıcı adı, şifre veya doğrulama adımını kontrol edin.");
 }
 
+async function testTebrpConnection() {
+  const session = await getDepotSession("tebrp", loginTebrp);
+  const page = session.page;
+  session.lastUsedAt = Date.now();
+
+  if (!(await page.locator("#araInput").isVisible().catch(() => false))) {
+    await closeDepotSession("tebrp");
+    throw new Error("TEBRP arama ekranı açılamadı.");
+  }
+
+  return {
+    ok: true,
+    source: "TEBRP",
+    loggedIn: true,
+    currentUrl: page.url(),
+    baseUrl: TEBRP_BASE_URL,
+    checkedAt: new Date().toISOString()
+  };
+}
+
 async function readTebrpProduct(page, requestedBarcode) {
   await page.locator("#isimHeader").waitFor({ state: "visible", timeout: 45000 });
   await page.locator("#anabilgi").waitFor({ state: "attached", timeout: 45000 });
@@ -2282,6 +2302,17 @@ app.get("/api/tebrp/status", checkAdminPassword, (req, res) => {
     baseUrl: TEBRP_BASE_URL,
     mode: "read-only"
   });
+});
+
+app.post("/api/tebrp/test", checkAdminPassword, async (req, res) => {
+  try {
+    return res.json(await testTebrpConnection());
+  } catch (error) {
+    console.error("TEBRP TEST ERROR:", error);
+    return res.status(500).json({
+      error: error?.message || "TEBRP bağlantı testi başarısız."
+    });
+  }
 });
 
 app.post("/api/tebrp/check", checkAdminPassword, async (req, res) => {
@@ -2614,6 +2645,7 @@ app.get("/", (req, res) => {
     adminLogin: "/api/admin-login",
     adminSession: "/api/admin-session",
     tebrpStatus: "/api/tebrp/status",
+    tebrpTest: "/api/tebrp/test",
     tebrpCheck: "/api/tebrp/check",
     tebrpCheckBatch: "/api/tebrp/check-batch",
     shopifyAdminTest: "/api/shopify-admin-test",
