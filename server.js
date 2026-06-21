@@ -131,8 +131,8 @@ const TEBRP_SEARCH_URL = process.env.TEBRP_SEARCH_URL || `${TEBRP_BASE_URL}uygul
 const TEBRP_USERNAME = process.env.TEBRP_USERNAME;
 const TEBRP_PASSWORD = process.env.TEBRP_PASSWORD;
 const TEBRP_CONNECTOR_TOKEN = String(process.env.TEBRP_CONNECTOR_TOKEN || "").trim();
-const TEBRP_CONNECTOR_ONLINE_MS = Number(process.env.TEBRP_CONNECTOR_ONLINE_MS || 45000);
-const TEBRP_CONNECTOR_JOB_TIMEOUT_MS = Number(process.env.TEBRP_CONNECTOR_JOB_TIMEOUT_MS || 120000);
+const TEBRP_CONNECTOR_ONLINE_MS = Number(process.env.TEBRP_CONNECTOR_ONLINE_MS || 180000);
+const TEBRP_CONNECTOR_JOB_TIMEOUT_MS = Number(process.env.TEBRP_CONNECTOR_JOB_TIMEOUT_MS || 90000);
 
 
 /* -------------------------------
@@ -2515,6 +2515,7 @@ app.get("/api/tebrp/status", checkAdminPassword, (req, res) => {
       lastError: tebrpConnectorState.lastError
     },
     queuedJobs: tebrpConnectorQueue.length,
+    onlineWindowMs: TEBRP_CONNECTOR_ONLINE_MS,
     baseUrl: TEBRP_BASE_URL,
     readOnly: true
   });
@@ -2548,7 +2549,7 @@ app.post("/api/tebrp/check-batch", checkAdminPassword, async (req, res) => {
     (Array.isArray(req.body?.barcodes) ? req.body.barcodes : [])
       .map((value) => String(value || "").replace(/\D/g, ""))
       .filter((value) => value.length >= 8 && value.length <= 14)
-  )).slice(0, 50);
+  )).slice(0, 200);
 
   if (!barcodes.length) {
     return res.status(400).json({ error: "Kontrol edilecek barkod bulunamadı." });
@@ -2556,7 +2557,7 @@ app.post("/api/tebrp/check-batch", checkAdminPassword, async (req, res) => {
 
   try {
     if (TEBRP_CONNECTOR_TOKEN) {
-      const result = await createTebrpConnectorJob("check-batch", { barcodes }, Math.max(TEBRP_CONNECTOR_JOB_TIMEOUT_MS, barcodes.length * 45000));
+      const result = await createTebrpConnectorJob("check-batch", { barcodes }, Math.max(TEBRP_CONNECTOR_JOB_TIMEOUT_MS, barcodes.length * 30000));
       const rows = Array.isArray(result?.results) ? result.results : [];
       for (const row of rows) {
         if (row?.ok && row?.result?.barcode) setCachedDepotResult("tebrp", row.result.barcode, row.result);
