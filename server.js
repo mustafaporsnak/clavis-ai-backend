@@ -125,6 +125,11 @@ const ALLIANCE_PASSWORD = process.env.ALLIANCE_PASSWORD;
 const SANCAK_BASE_URL = process.env.SANCAK_BASE_URL || "https://eticaret.sancakecza.com.tr/";
 const SANCAK_USERNAME = process.env.SANCAK_USERNAME;
 const SANCAK_PASSWORD = process.env.SANCAK_PASSWORD;
+const TEBRP_BASE_URL = process.env.TEBRP_BASE_URL || "https://www.tebrp.com/tebrp_plus/";
+const TEBRP_LOGIN_URL = process.env.TEBRP_LOGIN_URL || `${TEBRP_BASE_URL}login/login.jsp?from=%2Ftebrp_plus%2Fuygulama%3Foperation%3Dalt_giris`;
+const TEBRP_SEARCH_URL = process.env.TEBRP_SEARCH_URL || `${TEBRP_BASE_URL}uygulama?operation=alt_giris`;
+const TEBRP_USERNAME = process.env.TEBRP_USERNAME;
+const TEBRP_PASSWORD = process.env.TEBRP_PASSWORD;
 
 
 /* -------------------------------
@@ -249,9 +254,24 @@ async function runPersistentDepotCheck({ key, barcode, loginFn, findSearchInput,
 }
 
 function parseTurkishMoney(value) {
-  const match = String(value || "").match(/([\d.]+,\d{2})/);
-  if (!match) return null;
-  const number = Number(match[1].replaceAll(".", "").replace(",", "."));
+  let text = String(value ?? "")
+    .replace(/\u00a0/g, " ")
+    .replace(/[^0-9,.-]/g, "")
+    .trim();
+
+  if (!text) return null;
+
+  const lastComma = text.lastIndexOf(",");
+  const lastDot = text.lastIndexOf(".");
+
+  if (lastComma > -1 && lastDot > -1) {
+    if (lastComma > lastDot) text = text.replace(/\./g, "").replace(",", ".");
+    else text = text.replace(/,/g, "");
+  } else if (lastComma > -1) {
+    text = text.replace(",", ".");
+  }
+
+  const number = Number(text);
   return Number.isFinite(number) ? number : null;
 }
 
@@ -2087,11 +2107,221 @@ async function matchProductsFromShopify(answerText) {
   };
 }
 
+
+/* -------------------------------
+   TEBRP PSF TARAYICI OTOMASYONU
+   Barkodla ürün detayına gider; ürün adı, barkod ve PSF okur.
+-------------------------------- */
+
+async function loginTebrp(page) {
+  if (!TEBRP_USERNAME || !TEBRP_PASSWORD) {
+    throw new Error("TEBRP_USERNAME ve TEBRP_PASSWORD ortam değişkenleri tanımlı değil.");
+  }
+
+  await page.goto(TEBRP_SEARCH_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
+
+  const searchInput = page.locator("#araInput");
+  if (await searchInput.isVisible().catch(() => false)) return searchInput;
+
+  await page.goto(TEBRP_LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
+  await page.locator("#username").waitFor({ state: "visible", timeout: 30000 });
+  await page.locator("#username").fill(String(TEBRP_USERNAME));
+  await page.locator("#password").fill(String(TEBRP_PASSWORD));
+
+  await Promise.all([
+    page.waitForLoadState("domcontentloaded", { timeout: 60000 }).catch(() => {}),
+    page.locator("#giris_butonu").click()
+  ]);
+
+  await page.waitForTimeout(1200);
+
+  if (await page.locator("#araInput").isVisible().catch(() => false)) {
+    return page.locator("#araInput");
+  }
+
+  await page.goto(TEBRP_SEARCH_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
+  if (await page.locator("#araInput").isVisible().catch(() => false)) {
+    return page.locator("#araInput");
+  }
+
+  const loginError = await page.locator("#sonuc_mesaj").textContent().catch(() => "");
+  throw new Error(loginError?.trim() || "TEBRP girişi yapılamadı. Kullanıcı adı, şifre veya doğrulama adımını kontrol edin.");
+}
+
+async function readTebrpProduct(page, requestedBarcode) {
+  await page.locator("#isimHeader").waitFor({ state: "visible", timeout: 45000 });
+  await page.locator("#anabilgi").waitFor({ state: "attached", timeout: 45000 });
+
+  const raw = await page.evaluate(() => {
+    const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
+    const productName = clean(
+      document.querySelector('#isimHeader [data-name="urun_adi"]')?.textContent ||
+      document.querySelector("#isimHeader")?.textContent
+    );
+    const barcode = clean(document.querySelector("#barkod_img")?.textContent).replace(/\D/g, "");
+    const main = document.querySelector("#anabilgi");
+    const mainText = clean(main?.textContent);
+
+    let psfText = "";
+    let priceDate = "";
+    let vatRate = "";
+
+    if (main) {
+      const nodes = Array.from(main.querySelectorAll("span,div"));
+      const label = nodes.find((el) => /Perakende\s+Satış\s+Fiyatı/i.test(clean(el.textContent)) && clean(el.textContent).length < 80);
+      if (label?.parentElement) {
+        const siblings = Array.from(label.parentElement.children)
+          .map((el) => clean(el.textContent))
+          .filter(Boolean);
+        psfText = siblings.find((text) => text !== clean(label.textContent) && /\d/.test(text)) || "";
+      }
+    }
+
+    if (!psfText) {
+      const match = mainText.match(/Perakende\s+Satış\s+Fiyatı\s*:?\s*[₺TL]*\s*([\d.,]+)/i);
+      psfText = match?.[1] || "";
+    }
+
+    const dateMatch = mainText.match(/Fiyat\s+Tarihi\s*([0-3]?\d\/[01]?\d\/\d{4})/i);
+    priceDate = dateMatch?.[1] || "";
+
+    const vatMatch = mainText.match(/KDV\s*%?\s*(\d+(?:[.,]\d+)?)/i);
+    vatRate = vatMatch?.[1] || "";
+
+    return { productName, barcode, psfText, priceDate, vatRate, mainText: mainText.slice(0, 2500) };
+  });
+
+  const cleanRequested = String(requestedBarcode || "").replace(/\D/g, "");
+  if (!raw.barcode) throw new Error("TEBRP ürün detayında barkod okunamadı.");
+  if (raw.barcode !== cleanRequested) {
+    throw new Error(`TEBRP barkod eşleşmedi. Aranan: ${cleanRequested}, bulunan: ${raw.barcode}`);
+  }
+
+  const psf = parseTurkishMoney(raw.psfText);
+  if (psf === null || psf <= 0) {
+    throw new Error("TEBRP ürün detayında Perakende Satış Fiyatı okunamadı.");
+  }
+
+  return {
+    source: "TEBRP",
+    requestedBarcode: cleanRequested,
+    barcode: raw.barcode,
+    productName: raw.productName || null,
+    psf,
+    psfText: raw.psfText || null,
+    priceDate: raw.priceDate || null,
+    vatRate: raw.vatRate ? Number(String(raw.vatRate).replace(",", ".")) : null,
+    detailUrl: page.url(),
+    checkedAt: new Date().toISOString()
+  };
+}
+
+async function checkTebrpBarcode(barcode) {
+  const cleanBarcode = String(barcode || "").replace(/\D/g, "");
+  if (cleanBarcode.length < 8 || cleanBarcode.length > 14) {
+    throw new Error("Geçerli bir barkod girin (8-14 rakam).");
+  }
+
+  const cached = getCachedDepotResult("tebrp", cleanBarcode);
+  if (cached) return cached;
+
+  return withDepotLock("tebrp", async () => {
+    const cachedAfterWait = getCachedDepotResult("tebrp", cleanBarcode);
+    if (cachedAfterWait) return cachedAfterWait;
+
+    let lastError;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const session = await getDepotSession("tebrp", loginTebrp);
+        const page = session.page;
+        session.lastUsedAt = Date.now();
+
+        await page.goto(TEBRP_SEARCH_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
+        if (!(await page.locator("#araInput").isVisible().catch(() => false))) {
+          await closeDepotSession("tebrp");
+          throw new Error("TEBRP oturumu kapandı; yeniden giriş gerekiyor.");
+        }
+
+        const input = page.locator("#araInput");
+        await input.fill("");
+        await input.fill(cleanBarcode);
+
+        const previousUrl = page.url();
+        await input.press("Enter");
+        await page.waitForURL((url) => url.href !== previousUrl && /operation=urun_detay/i.test(url.href), { timeout: 45000 });
+
+        const result = await readTebrpProduct(page, cleanBarcode);
+        setCachedDepotResult("tebrp", cleanBarcode, result);
+        return result;
+      } catch (error) {
+        lastError = error;
+        await closeDepotSession("tebrp");
+      }
+    }
+
+    throw lastError || new Error("TEBRP barkod sorgusu yapılamadı.");
+  });
+}
+
 /* -------------------------------
    TEMEL ENDPOINTLER
 -------------------------------- */
 
 
+
+
+/* -------------------------------
+   TEBRP PSF KONTROL ENDPOINTLERİ
+-------------------------------- */
+
+app.get("/api/tebrp/status", checkAdminPassword, (req, res) => {
+  return res.json({
+    ok: true,
+    source: "TEBRP",
+    configured: Boolean(TEBRP_USERNAME && TEBRP_PASSWORD),
+    baseUrl: TEBRP_BASE_URL,
+    mode: "read-only"
+  });
+});
+
+app.post("/api/tebrp/check", checkAdminPassword, async (req, res) => {
+  try {
+    const result = await checkTebrpBarcode(req.body?.barcode);
+    return res.json({ ok: true, result });
+  } catch (error) {
+    console.error("TEBRP CHECK ERROR:", error);
+    return res.status(500).json({
+      error: error?.message || "TEBRP barkod kontrolü yapılamadı."
+    });
+  }
+});
+
+app.post("/api/tebrp/check-batch", checkAdminPassword, async (req, res) => {
+  const barcodes = Array.from(new Set(
+    (Array.isArray(req.body?.barcodes) ? req.body.barcodes : [])
+      .map((value) => String(value || "").replace(/\D/g, ""))
+      .filter((value) => value.length >= 8 && value.length <= 14)
+  )).slice(0, 20);
+
+  if (!barcodes.length) {
+    return res.status(400).json({ error: "Kontrol edilecek barkod bulunamadı." });
+  }
+
+  const results = [];
+  for (const barcode of barcodes) {
+    try {
+      results.push({ ok: true, result: await checkTebrpBarcode(barcode) });
+    } catch (error) {
+      results.push({
+        ok: false,
+        requestedBarcode: barcode,
+        error: error?.message || "Kontrol edilemedi."
+      });
+    }
+  }
+
+  return res.json({ ok: true, count: results.length, results });
+});
 
 /* -------------------------------
    BEK DEPO KONTROL ENDPOINTLERİ
@@ -2348,6 +2578,9 @@ app.get("/", (req, res) => {
     health: "/health",
     adminLogin: "/api/admin-login",
     adminSession: "/api/admin-session",
+    tebrpStatus: "/api/tebrp/status",
+    tebrpCheck: "/api/tebrp/check",
+    tebrpCheckBatch: "/api/tebrp/check-batch",
     shopifyAdminTest: "/api/shopify-admin-test",
     shopifyProducts: "/api/shopify-products",
     adminProductsFull: "/api/admin-products-full",
