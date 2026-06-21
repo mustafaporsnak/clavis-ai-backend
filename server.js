@@ -1088,13 +1088,25 @@ function normalizeText(value) {
 function toNumber(value) {
   if (typeof value === "number") return Number.isFinite(value) ? value : 0;
 
-  const cleaned = String(value || "")
-    .replace("TL", "")
-    .replace("₺", "")
-    .replaceAll(".", "")
-    .replace(",", ".")
-    .replace("%", "")
+  let cleaned = String(value ?? "")
+    .replace(/TL|₺|%/gi, "")
+    .replace(/\s/g, "")
     .trim();
+
+  if (!cleaned) return 0;
+
+  const lastComma = cleaned.lastIndexOf(",");
+  const lastDot = cleaned.lastIndexOf(".");
+
+  if (lastComma !== -1 && lastDot !== -1) {
+    if (lastComma > lastDot) {
+      cleaned = cleaned.replaceAll(".", "").replace(",", ".");
+    } else {
+      cleaned = cleaned.replaceAll(",", "");
+    }
+  } else if (lastComma !== -1) {
+    cleaned = cleaned.replace(",", ".");
+  }
 
   const n = Number(cleaned);
   return Number.isFinite(n) ? n : 0;
