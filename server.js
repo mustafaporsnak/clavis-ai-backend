@@ -132,7 +132,7 @@ const TEBRP_USERNAME = process.env.TEBRP_USERNAME;
 const TEBRP_PASSWORD = process.env.TEBRP_PASSWORD;
 const TEBRP_CONNECTOR_TOKEN = String(process.env.TEBRP_CONNECTOR_TOKEN || "").trim();
 const TEBRP_CONNECTOR_ONLINE_MS = Number(process.env.TEBRP_CONNECTOR_ONLINE_MS || 180000);
-const TEBRP_CONNECTOR_JOB_TIMEOUT_MS = Number(process.env.TEBRP_CONNECTOR_JOB_TIMEOUT_MS || 90000);
+const TEBRP_CONNECTOR_JOB_TIMEOUT_MS = Number(process.env.TEBRP_CONNECTOR_JOB_TIMEOUT_MS || 120000);
 
 
 /* -------------------------------
@@ -2374,6 +2374,8 @@ function createTebrpConnectorJob(type, payload = {}, timeoutMs = TEBRP_CONNECTOR
 
   const id = crypto.randomUUID();
   const createdAt = Date.now();
+  const effectiveTimeoutMs = Math.max(10000, Number(timeoutMs) || TEBRP_CONNECTOR_JOB_TIMEOUT_MS);
+  const expiresAt = createdAt + effectiveTimeoutMs;
 
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -2383,14 +2385,16 @@ function createTebrpConnectorJob(type, payload = {}, timeoutMs = TEBRP_CONNECTOR
         const index = tebrpConnectorQueue.findIndex((item) => item.id === id);
         if (index >= 0) tebrpConnectorQueue.splice(index, 1);
       }
-      reject(new Error("TEBRP Connector yanıt süresi doldu."));
-    }, Math.max(10000, Number(timeoutMs) || TEBRP_CONNECTOR_JOB_TIMEOUT_MS));
+      reject(new Error(`TEBRP Connector yanıt süresi doldu (${Math.round(effectiveTimeoutMs / 1000)} sn).`));
+    }, effectiveTimeoutMs);
 
     const job = {
       id,
       type,
       payload,
       createdAt,
+      expiresAt,
+      timeoutMs: effectiveTimeoutMs,
       assignedAt: null,
       connectorId: null,
       resolve,
@@ -2454,7 +2458,7 @@ app.get("/api/tebrp-connector/jobs/next", checkTebrpConnectorToken, (req, res) =
   while (tebrpConnectorQueue.length) {
     const job = tebrpConnectorQueue.shift();
     if (!job || !tebrpConnectorJobs.has(job.id)) continue;
-    if (now - job.createdAt > TEBRP_CONNECTOR_JOB_TIMEOUT_MS) continue;
+    if (job.expiresAt && now > job.expiresAt) continue;
 
     job.assignedAt = now;
     job.connectorId = String(req.query?.connectorId || "").slice(0, 100) || null;
@@ -2557,7 +2561,8 @@ app.post("/api/tebrp/check-batch", checkAdminPassword, async (req, res) => {
 
   try {
     if (TEBRP_CONNECTOR_TOKEN) {
-      const result = await createTebrpConnectorJob("check-batch", { barcodes }, Math.max(TEBRP_CONNECTOR_JOB_TIMEOUT_MS, barcodes.length * 30000));
+      const batchTimeoutMs = Math.max(TEBRP_CONNECTOR_JOB_TIMEOUT_MS, 60000 + barcodes.length * 75000);
+      const result = await createTebrpConnectorJob("check-batch", { barcodes }, batchTimeoutMs);
       const rows = Array.isArray(result?.results) ? result.results : [];
       for (const row of rows) {
         if (row?.ok && row?.result?.barcode) setCachedDepotResult("tebrp", row.result.barcode, row.result);
