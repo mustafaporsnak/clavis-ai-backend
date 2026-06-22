@@ -245,6 +245,20 @@ async function runPersistentDepotCheck({ key, barcode, loginFn, findSearchInput,
         }
         await executeSearch(session.page, input, cleanBarcode);
         const result = await readProduct(session.page, cleanBarcode);
+
+        const returnedBarcode = String(
+          result?.verifiedBarcode ||
+          result?.barcode ||
+          result?.requestedBarcode ||
+          ""
+        ).replace(/\D/g, "");
+
+        if (returnedBarcode !== cleanBarcode) {
+          throw new Error(
+            `${key.toUpperCase()} eski veya farklı ürün sonucu döndürdü. Aranan: ${cleanBarcode}, okunan: ${returnedBarcode || "yok"}`
+          );
+        }
+
         setCachedDepotResult(key, cleanBarcode, result);
         return result;
       } catch (error) {
@@ -378,6 +392,10 @@ async function readBekProduct(page, requestedBarcode) {
         const digitsOnly = normalized.replace(/\D/g, "");
 
         const hasBarcode = digitsOnly.includes(requestedBarcode);
+        const exactBarcodeLine = String(text || "")
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .some((line) => (line.match(/\d{8,14}/g) || []).includes(requestedBarcode));
         const hasPsf = /\bPSF\b/i.test(normalized);
         const hasDsf = /\bDSF\b/i.test(normalized);
         const hasNet = /Net\s*Fiyat/i.test(normalized);
@@ -392,7 +410,7 @@ async function readBekProduct(page, requestedBarcode) {
         if (hasStock) score += 3;
         if (hasProductDetail) score += 4;
 
-        candidates.push({ frame, text, normalized, score, hasBarcode, hasPsf, hasStock, hasProductDetail });
+        candidates.push({ frame, text, normalized, score, hasBarcode, exactBarcodeLine, hasPsf, hasStock, hasProductDetail });
       } catch {}
     }
 
@@ -401,7 +419,7 @@ async function readBekProduct(page, requestedBarcode) {
 
     // Ürün detay sayfası için barkodun yanında en az PSF veya stok ve detay işareti olmalı.
     const exact = candidates.find((c) =>
-      c.hasBarcode && c.hasProductDetail && (c.hasPsf || c.hasStock)
+      c.exactBarcodeLine && c.hasProductDetail && (c.hasPsf || c.hasStock)
     );
 
     if (exact) {
@@ -412,7 +430,7 @@ async function readBekProduct(page, requestedBarcode) {
     await page.waitForTimeout(1200);
   }
 
-  if (!best || best.score < 8) {
+  if (!best || best.score < 8 || !best.exactBarcodeLine) {
     console.error("BEK DEBUG - pages:", contextPageDebug(page));
     console.error("BEK DEBUG - best candidate:", best ? {
       url: best.frame.url(), score: best.score, preview: best.normalized.slice(0, 1800)
@@ -442,7 +460,7 @@ async function readBekProduct(page, requestedBarcode) {
       const candidate = lines[i].trim();
       if (
         candidate.length >= 8 &&
-        !/^(PSF|DSF|Net Fiyat|Ürün Özellikleri|Satış Detayı|Stokta|Menü|Hepsi|İlaç|İlaç Dışı)$/i.test(candidate) &&
+        !/^(PSF|DSF|Net Fiyat|Fiyat Tarihçesi|Ürün Özellikleri|Satış Detayı|Stokta|Menü|Hepsi|İlaç|İlaç Dışı)$/i.test(candidate) &&
         !/Daha Sonrası İçin Kaydedilenler/i.test(candidate) &&
         !/Kelime, Barkod|arama yapabilmek/i.test(candidate) &&
         !/^₺/.test(candidate) &&
@@ -459,7 +477,7 @@ async function readBekProduct(page, requestedBarcode) {
     productName = lines.find((line) =>
       line.length >= 10 &&
       /[A-ZÇĞİÖŞÜ]/.test(line) &&
-      !/^(PSF|DSF|NET FİYAT|ÜRÜN ÖZELLİKLERİ|SATIŞ DETAYI|STOKTA|DAHA SONRASI)/i.test(line) &&
+      !/^(PSF|DSF|NET FİYAT|FİYAT TARİHÇESİ|ÜRÜN ÖZELLİKLERİ|SATIŞ DETAYI|STOKTA|DAHA SONRASI)/i.test(line) &&
       !/Kelime, Barkod|arama yapabilmek|Hesaplar ve Raporlar/i.test(line)
     ) || "";
   }
@@ -475,6 +493,7 @@ async function readBekProduct(page, requestedBarcode) {
     depot: "BEK",
     requestedBarcode,
     barcode: requestedBarcode,
+    verifiedBarcode: requestedBarcode,
     productName,
     psf: psfMatch ? parseTurkishMoney(psfMatch[1]) : null,
     dsf: dsfMatch ? parseTurkishMoney(dsfMatch[1]) : null,
@@ -498,9 +517,13 @@ async function checkBekBarcode(barcode) {
     loginFn: loginBek,
     findSearchInput: findBekSearchInput,
     executeSearch: async (page, input, cleanBarcode) => {
-      await input.fill("");
-      await input.fill(cleanBarcode);
-      await input.press("Enter");
+      // Her barkodda portalı temiz arama ekranına döndür. Böylece önceki
+      // ürünün adı, fiyatı ve stok durumu yeni ürüne taşınamaz.
+      await page.goto(BEK_BASE_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
+      const freshInput = await findBekSearchInput(page);
+      await freshInput.fill("");
+      await freshInput.fill(cleanBarcode);
+      await freshInput.press("Enter");
     },
     readProduct: readBekProduct
   });
@@ -595,6 +618,10 @@ async function readIskoopProduct(page, requestedBarcode) {
         const digitsOnly = normalized.replace(/\D/g, "");
 
         const hasBarcode = digitsOnly.includes(requestedBarcode);
+        const exactBarcodeLine = String(text || "")
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .some((line) => (line.match(/\d{8,14}/g) || []).includes(requestedBarcode));
         const hasPsf = /\b(?:PSF|TVS)\b/i.test(normalized);
         const hasDsf = /\bDSF\b/i.test(normalized);
         const hasNet = /Net\s*Fiyat/i.test(normalized);
@@ -609,7 +636,7 @@ async function readIskoopProduct(page, requestedBarcode) {
         if (hasStock) score += 3;
         if (hasProductDetail) score += 4;
 
-        candidates.push({ frame, text, normalized, score, hasBarcode, hasPsf, hasStock, hasProductDetail });
+        candidates.push({ frame, text, normalized, score, hasBarcode, exactBarcodeLine, hasPsf, hasStock, hasProductDetail });
       } catch {}
     }
 
@@ -618,7 +645,7 @@ async function readIskoopProduct(page, requestedBarcode) {
 
     // Ürün detay sayfası için barkodun yanında en az PSF veya stok ve detay işareti olmalı.
     const exact = candidates.find((c) =>
-      c.hasBarcode && c.hasProductDetail && (c.hasPsf || c.hasStock)
+      c.exactBarcodeLine && c.hasProductDetail && (c.hasPsf || c.hasStock)
     );
 
     if (exact) {
@@ -629,7 +656,7 @@ async function readIskoopProduct(page, requestedBarcode) {
     await page.waitForTimeout(1200);
   }
 
-  if (!best || best.score < 8) {
+  if (!best || best.score < 8 || !best.exactBarcodeLine) {
     console.error("İSKOOP DEBUG - pages:", contextPageDebug(page));
     console.error("İSKOOP DEBUG - best candidate:", best ? {
       url: best.frame.url(), score: best.score, preview: best.normalized.slice(0, 1800)
@@ -659,7 +686,7 @@ async function readIskoopProduct(page, requestedBarcode) {
       const candidate = lines[i].trim();
       if (
         candidate.length >= 8 &&
-        !/^(PSF|TVS|DSF|Net Fiyat|Ürün Özellikleri|Satış Detayı|Stokta|Menü|Hepsi|İlaç|İlaç Dışı)$/i.test(candidate) &&
+        !/^(PSF|TVS|DSF|Net Fiyat|Fiyat Tarihçesi|Ürün Özellikleri|Satış Detayı|Stokta|Menü|Hepsi|İlaç|İlaç Dışı)$/i.test(candidate) &&
         !/Daha Sonrası İçin Kaydedilenler/i.test(candidate) &&
         !/Kelime, Barkod|arama yapabilmek/i.test(candidate) &&
         !/^₺/.test(candidate) &&
@@ -676,7 +703,7 @@ async function readIskoopProduct(page, requestedBarcode) {
     productName = lines.find((line) =>
       line.length >= 10 &&
       /[A-ZÇĞİÖŞÜ]/.test(line) &&
-      !/^(PSF|TVS|DSF|NET FİYAT|ÜRÜN ÖZELLİKLERİ|SATIŞ DETAYI|STOKTA|DAHA SONRASI)/i.test(line) &&
+      !/^(PSF|TVS|DSF|NET FİYAT|FİYAT TARİHÇESİ|ÜRÜN ÖZELLİKLERİ|SATIŞ DETAYI|STOKTA|DAHA SONRASI)/i.test(line) &&
       !/Kelime, Barkod|arama yapabilmek|Hesaplar ve Raporlar/i.test(line)
     ) || "";
   }
@@ -692,6 +719,7 @@ async function readIskoopProduct(page, requestedBarcode) {
     depot: "İSKOOP",
     requestedBarcode,
     barcode: requestedBarcode,
+    verifiedBarcode: requestedBarcode,
     productName,
     psf: psfMatch ? parseTurkishMoney(psfMatch[1]) : null,
     dsf: dsfMatch ? parseTurkishMoney(dsfMatch[1]) : null,
@@ -711,9 +739,13 @@ async function checkIskoopBarcode(barcode) {
     loginFn: loginIskoop,
     findSearchInput: findIskoopSearchInput,
     executeSearch: async (page, input, cleanBarcode) => {
-      await input.fill("");
-      await input.fill(cleanBarcode);
-      await input.press("Enter");
+      // Her barkodda portalı temiz arama ekranına döndür. Böylece önceki
+      // ürünün adı, fiyatı ve stok durumu yeni ürüne taşınamaz.
+      await page.goto(ISKOOP_BASE_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
+      const freshInput = await findIskoopSearchInput(page);
+      await freshInput.fill("");
+      await freshInput.fill(cleanBarcode);
+      await freshInput.press("Enter");
     },
     readProduct: readIskoopProduct
   });
@@ -2641,6 +2673,9 @@ app.post("/api/depot/bek/check-batch", checkAdminPassword, async (req, res) => {
 
     for (const barcode of barcodes) {
       try {
+        await page.goto(BEK_BASE_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
+        searchInput = await findBekSearchInput(page);
+        await searchInput.fill("");
         await searchInput.fill(barcode);
         await searchInput.press("Enter");
         results.push({ ok: true, ...(await readBekProduct(page, barcode)) });
@@ -2724,6 +2759,9 @@ app.post("/api/depot/iskoop/check-batch", checkAdminPassword, async (req, res) =
 
     for (const barcode of barcodes) {
       try {
+        await page.goto(ISKOOP_BASE_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
+        searchInput = await findIskoopSearchInput(page);
+        await searchInput.fill("");
         await searchInput.fill(barcode);
         await searchInput.press("Enter");
         results.push({ ok: true, ...(await readIskoopProduct(page, barcode)) });
@@ -2885,6 +2923,7 @@ app.get("/", (req, res) => {
     priceAudit: "/api/price-audit",
     costSheet: "/api/cost-sheet",
     updateVariant: "/api/update-variant-basic",
+    updateProductTitle: "/api/update-product-title",
     updateInventoryItem: "/api/update-inventory-item",
     shopifyLocations: "/api/shopify-locations",
     updateInventoryQuantity: "/api/update-inventory-quantity",
@@ -3151,6 +3190,64 @@ app.get("/api/product-operations", checkAdminPassword, async (req, res) => {
 /* -------------------------------
    SHOPIFY YAZMA ENDPOINTLERİ
 -------------------------------- */
+
+app.post("/api/update-product-title", checkAdminPassword, async (req, res) => {
+  try {
+    const productId = String(req.body?.productId || "").trim();
+    const title = String(req.body?.title || "").replace(/\s+/g, " ").trim();
+
+    if (!productId) {
+      return res.status(400).json({ error: "productId eksik." });
+    }
+
+    if (title.length < 2 || title.length > 255) {
+      return res.status(400).json({
+        error: "Ürün adı 2-255 karakter arasında olmalı."
+      });
+    }
+
+    const data = await shopifyGraphQL(
+      `
+      mutation productUpdate($product: ProductUpdateInput!) {
+        productUpdate(product: $product) {
+          product {
+            id
+            title
+            handle
+          }
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+      `,
+      {
+        product: {
+          id: productId,
+          title
+        }
+      }
+    );
+
+    const errors = data.productUpdate?.userErrors || [];
+    if (errors.length) {
+      return res.status(400).json({
+        error: errors.map((item) => item.message).join(", ")
+      });
+    }
+
+    return res.json({
+      status: "ok",
+      product: data.productUpdate?.product || null
+    });
+  } catch (error) {
+    console.error("UPDATE PRODUCT TITLE ERROR:", error);
+    return res.status(500).json({
+      error: error.message || "Shopify ürün adı güncellenemedi."
+    });
+  }
+});
 
 app.post("/api/update-variant-basic", checkAdminPassword, async (req, res) => {
   try {
