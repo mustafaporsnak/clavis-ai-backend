@@ -249,7 +249,6 @@ async function runPersistentDepotCheck({ key, barcode, loginFn, findSearchInput,
         const returnedBarcode = String(
           result?.verifiedBarcode ||
           result?.barcode ||
-          result?.requestedBarcode ||
           ""
         ).replace(/\D/g, "");
 
@@ -268,6 +267,31 @@ async function runPersistentDepotCheck({ key, barcode, loginFn, findSearchInput,
     }
     throw lastError || new Error("Depo kontrolü tamamlanamadı.");
   });
+}
+
+
+async function submitSapPortalBarcodeSearch(page, input, cleanBarcode, depotName) {
+  if (!input || !(await input.isVisible().catch(() => false))) {
+    throw new Error(`${depotName} ürün arama kutusu görünür değil.`);
+  }
+
+  // SAP portalı tamamen yeniden yüklemek oturum kabuğunu ve uygulama iframe'ini
+  // bozabildiği için BASE_URL'e yeniden gitmiyoruz. Mevcut global arama alanını
+  // temizleyip yeni barkodu aynı oturumda gönderiyoruz.
+  await input.click({ force: true }).catch(() => {});
+  await input.fill("");
+  await page.waitForTimeout(150);
+  await input.fill(cleanBarcode);
+
+  const writtenBarcode = String(await input.inputValue().catch(() => "")).replace(/\D/g, "");
+  if (writtenBarcode !== cleanBarcode) {
+    throw new Error(
+      `${depotName} barkodu arama alanına yazılamadı. Beklenen: ${cleanBarcode}, yazılan: ${writtenBarcode || "boş"}`
+    );
+  }
+
+  await input.press("Enter");
+  await page.waitForTimeout(650);
 }
 
 function parseTurkishMoney(value) {
@@ -355,7 +379,7 @@ async function loginBek(page) {
     }
   }
 
-  throw lastError || new Error("BEK girişinden sonra ürün arama ekranı açılmadı.");
+  throw new Error(`${lastError?.message || "BEK ürün arama kutusu bulunamadı."} | URL: ${page.url()} | Frameler: ${contextPageDebug(page)}`);
 }
 
 function pickBekProductName(lines, barcode) {
@@ -442,6 +466,13 @@ async function readBekProduct(page, requestedBarcode) {
   const bodyText = best.text;
   const normalizedBody = best.normalized;
   const lines = bodyText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const verifiedBarcode = lines.some(
+    (line) => (line.match(/\d{8,14}/g) || []).includes(requestedBarcode)
+  ) ? requestedBarcode : "";
+
+  if (!verifiedBarcode) {
+    throw new Error(`BEK yeni ürün barkodunu doğrulayamadı: ${requestedBarcode}`);
+  }
 
   const moneyPattern = "(?:₺|TL)?\\s*([\\d.]+,\\d{2})";
   const psfMatch = normalizedBody.match(new RegExp("\\bPSF\\b[\\s\\S]{0,100}?" + moneyPattern, "i"));
@@ -492,8 +523,8 @@ async function readBekProduct(page, requestedBarcode) {
   return {
     depot: "BEK",
     requestedBarcode,
-    barcode: requestedBarcode,
-    verifiedBarcode: requestedBarcode,
+    barcode: verifiedBarcode,
+    verifiedBarcode,
     productName,
     psf: psfMatch ? parseTurkishMoney(psfMatch[1]) : null,
     dsf: dsfMatch ? parseTurkishMoney(dsfMatch[1]) : null,
@@ -517,13 +548,7 @@ async function checkBekBarcode(barcode) {
     loginFn: loginBek,
     findSearchInput: findBekSearchInput,
     executeSearch: async (page, input, cleanBarcode) => {
-      // Her barkodda portalı temiz arama ekranına döndür. Böylece önceki
-      // ürünün adı, fiyatı ve stok durumu yeni ürüne taşınamaz.
-      await page.goto(BEK_BASE_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
-      const freshInput = await findBekSearchInput(page);
-      await freshInput.fill("");
-      await freshInput.fill(cleanBarcode);
-      await freshInput.press("Enter");
+      await submitSapPortalBarcodeSearch(page, input, cleanBarcode, "BEK");
     },
     readProduct: readBekProduct
   });
@@ -598,7 +623,7 @@ async function loginIskoop(page) {
     }
   }
 
-  throw lastError || new Error("İSKOOP girişinden sonra ürün arama ekranı açılmadı.");
+  throw new Error(`${lastError?.message || "İSKOOP ürün arama kutusu bulunamadı."} | URL: ${page.url()} | Frameler: ${contextPageDebug(page)}`);
 }
 
 async function readIskoopProduct(page, requestedBarcode) {
@@ -668,6 +693,13 @@ async function readIskoopProduct(page, requestedBarcode) {
   const bodyText = best.text;
   const normalizedBody = best.normalized;
   const lines = bodyText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const verifiedBarcode = lines.some(
+    (line) => (line.match(/\d{8,14}/g) || []).includes(requestedBarcode)
+  ) ? requestedBarcode : "";
+
+  if (!verifiedBarcode) {
+    throw new Error(`İSKOOP yeni ürün barkodunu doğrulayamadı: ${requestedBarcode}`);
+  }
 
   const moneyPattern = "(?:₺|TL)?\\s*([\\d.]+,\\d{2})";
   const psfMatch = normalizedBody.match(new RegExp("\\b(?:PSF|TVS)\\b[\\s\\S]{0,100}?" + moneyPattern, "i"));
@@ -718,8 +750,8 @@ async function readIskoopProduct(page, requestedBarcode) {
   return {
     depot: "İSKOOP",
     requestedBarcode,
-    barcode: requestedBarcode,
-    verifiedBarcode: requestedBarcode,
+    barcode: verifiedBarcode,
+    verifiedBarcode,
     productName,
     psf: psfMatch ? parseTurkishMoney(psfMatch[1]) : null,
     dsf: dsfMatch ? parseTurkishMoney(dsfMatch[1]) : null,
@@ -739,13 +771,7 @@ async function checkIskoopBarcode(barcode) {
     loginFn: loginIskoop,
     findSearchInput: findIskoopSearchInput,
     executeSearch: async (page, input, cleanBarcode) => {
-      // Her barkodda portalı temiz arama ekranına döndür. Böylece önceki
-      // ürünün adı, fiyatı ve stok durumu yeni ürüne taşınamaz.
-      await page.goto(ISKOOP_BASE_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
-      const freshInput = await findIskoopSearchInput(page);
-      await freshInput.fill("");
-      await freshInput.fill(cleanBarcode);
-      await freshInput.press("Enter");
+      await submitSapPortalBarcodeSearch(page, input, cleanBarcode, "İSKOOP");
     },
     readProduct: readIskoopProduct
   });
@@ -2673,14 +2699,11 @@ app.post("/api/depot/bek/check-batch", checkAdminPassword, async (req, res) => {
 
     for (const barcode of barcodes) {
       try {
-        await page.goto(BEK_BASE_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
         searchInput = await findBekSearchInput(page);
-        await searchInput.fill("");
-        await searchInput.fill(barcode);
-        await searchInput.press("Enter");
+        await submitSapPortalBarcodeSearch(page, searchInput, barcode, "BEK");
         results.push({ ok: true, ...(await readBekProduct(page, barcode)) });
 
-        // Bir sonraki arama için üst arama kutusunu yeniden bul.
+        // Bir sonraki arama için güncel üst arama kutusunu yeniden bul.
         searchInput = await findBekSearchInput(page);
       } catch (error) {
         results.push({ ok: false, requestedBarcode: barcode, error: error?.message || "Kontrol edilemedi." });
@@ -2759,11 +2782,8 @@ app.post("/api/depot/iskoop/check-batch", checkAdminPassword, async (req, res) =
 
     for (const barcode of barcodes) {
       try {
-        await page.goto(ISKOOP_BASE_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
         searchInput = await findIskoopSearchInput(page);
-        await searchInput.fill("");
-        await searchInput.fill(barcode);
-        await searchInput.press("Enter");
+        await submitSapPortalBarcodeSearch(page, searchInput, barcode, "İSKOOP");
         results.push({ ok: true, ...(await readIskoopProduct(page, barcode)) });
         searchInput = await findIskoopSearchInput(page);
       } catch (error) {
